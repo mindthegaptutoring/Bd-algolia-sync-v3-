@@ -1,43 +1,18 @@
 name: BD Algolia Sync
-
 on:
   workflow_dispatch:  # manual trigger + cron-job.org webhook
-
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install requests "algoliasearch>=3,<4"
-
-      - name: Debug
-        run: |
-          echo "--- data_posts/get by user_id=32 ---"
-          curl -s "https://learn.everyavenue.com/api/v2/data_posts/get?property=user_id&property_value=32" \
-            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6"
-          echo ""
-          echo "--- portfolio_groups/get by user_id=32 ---"
-          curl -s "https://learn.everyavenue.com/api/v2/users_portfolio_groups/get?property=user_id&property_value=32" \
-            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6"
-          echo ""
-          echo "--- data_posts/get by user_id=35 (Alejandro) ---"
-          curl -s "https://learn.everyavenue.com/api/v2/data_posts/get?property=user_id&property_value=35" \
-            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6"
-          echo ""
-          echo "--- portfolio_groups/get by user_id=35 (Alejandro) ---"
-          curl -s "https://learn.everyavenue.com/api/v2/users_portfolio_groups/get?property=user_id&property_value=35" \
-            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6"
-          echo ""
-
       - name: Run sync
         env:
           BD_API_KEY:         ${{ secrets.BD_API_KEY }}
