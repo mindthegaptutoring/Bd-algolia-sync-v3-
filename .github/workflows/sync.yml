@@ -17,7 +17,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests algoliasearch
+        run: pip install requests "algoliasearch>=3,<4"
 
       - name: Run sync
         env:
