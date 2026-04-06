@@ -55,6 +55,41 @@ MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
 SNIPPET_CHARS    = 205
 
+# ── Field value mappings (raw BD values → display labels) ────────────────────
+
+FORMAT_MAP = {
+    "1": "1-on-1 Teaching",
+    "2": "Coaching & Mentoring",
+    "3": "Online Group Classes",
+    "4": "Resources",
+    "5": "Self Paced Classes",
+    "6": "Tutoring",
+}
+
+GRADE_MAP = {
+    "prek":            "Pre-K",
+    "k2":              "K-2",
+    "gr_36":           "Gr 3-6",
+    "gr_68":           "Gr 6-8",
+    "gr_912":          "Gr 9-12",
+    "postsecondary":   "Post-Secondary",
+    "adult_education": "Adult Education",
+}
+
+SCHEDULING_MAP = {
+    "flexible_scheduling":        "Flexible scheduling",
+    "meets_at_a_set_weekly_time": "Meets at a set weekly time",
+    "meets_multiple_times_per_week": "Meets multiple times per week",
+    "onetime_session":            "One-time session",
+    "self_paced":                 "Self-paced (no live meetings)",
+}
+
+DELIVERY_MAP = {
+    "synchronous":             "Live, scheduled sessions",
+    "asynchronous":            "Self-paced, learn anytime",
+    "synchronous_asynchronous": "Hybrid, mix of both",
+}
+
 
 # ── BD API helpers ────────────────────────────────────────────────────────────
 
@@ -291,16 +326,16 @@ def build_listing_record(listing: dict) -> dict:
         "snippet":          snippet,
         "thumbnail":        thumbnail,
         "tags":             tags,
-        "group_category":   (listing.get("group_category") or "").strip(),
+        "subject":          (listing.get("group_category") or "").strip(),
         "listing_url":      f"{BD_BASE}/{listing.get('group_filename', '').lstrip('/')}",
         "post_link":        (listing.get("post_link") or "").strip(),
         "post_location":    (listing.get("post_location") or "").strip(),
         "class_rates":      (listing.get("class_rates") or "").strip(),
-        "grades":           resolve_tags(listing.get("grades", "")),
-        "delivery_method":  (listing.get("delivery_method") or "").strip().rstrip("_"),
-        "format":           (listing.get("format") or "").strip(),
+        "grades":           [GRADE_MAP.get(g, g) for g in resolve_tags(listing.get("grades", ""))],
+        "delivery_method":  DELIVERY_MAP.get((listing.get("delivery_method") or "").strip().rstrip("_"), (listing.get("delivery_method") or "").strip().rstrip("_")),
+        "format":           FORMAT_MAP.get((listing.get("format") or "").strip(), (listing.get("format") or "").strip()),
         "duration":         (listing.get("duration") or "").strip(),
-        "scheduling":       (listing.get("scheduling") or "").strip(),
+        "scheduling":       [SCHEDULING_MAP.get(s, s) for s in resolve_tags(listing.get("scheduling", ""))],
         "prerequisites":    (listing.get("prerequisites") or "").strip(),
         "cohort_size":      listing.get("cohort_size"),
         "listing_category": (listing.get("listing_category") or "").strip(),
