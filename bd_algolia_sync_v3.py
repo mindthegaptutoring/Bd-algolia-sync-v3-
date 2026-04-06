@@ -293,7 +293,7 @@ def build_educator_record(user: dict) -> dict:
     return record
 
 
-def build_listing_record(listing: dict) -> dict:
+def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     gid         = str(listing.get("group_id") or "")
     title       = (listing.get("group_name") or "").strip()
     description = strip_html(listing.get("group_desc") or "")
@@ -343,7 +343,7 @@ def build_listing_record(listing: dict) -> dict:
         "city":             city,
         "state":            state,
         "country":          country,
-        "profile_photo":    nested_user.get("profile_photo", "") if isinstance(nested_user, dict) else "",
+        "profile_photo":    educator_photo,
     }
 
     return record
@@ -383,8 +383,12 @@ def main():
                 if str(l.get("group_status")) == LISTING_STATUS
                 and str(l.get("data_id")) == LISTING_DATA_ID
             ]
+            # Get educator profile photo from user record (not in nested listing user object)
+            educator_photo = (user.get("profile_photo") or "").strip()
+            if educator_photo and not educator_photo.startswith("http"):
+                educator_photo = BD_BASE + "/" + educator_photo.lstrip("/")
             for listing in published:
-                listing_records.append(enforce_byte_cap(build_listing_record(listing)))
+                listing_records.append(enforce_byte_cap(build_listing_record(listing, educator_photo)))
             if published:
                 print(f"  {len(published)} published listings")
             else:
