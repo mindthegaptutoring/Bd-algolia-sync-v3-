@@ -19,11 +19,6 @@ jobs:
       - name: Install dependencies
         run: pip install requests "algoliasearch>=3,<4"
 
-      - name: Debug BD API
-        run: |
-          curl -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" "https://learn.everyavenue.com/api/v2/tags_data/get/1"
-          curl -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" -X POST "https://learn.everyavenue.com/api/v2/rel_tags" -H "Content-Type: application/json" -d '{}'
-
       - name: Run sync
         env:
           BD_API_KEY:         ${{ secrets.BD_API_KEY }}
