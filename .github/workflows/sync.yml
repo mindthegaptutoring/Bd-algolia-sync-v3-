@@ -19,6 +19,25 @@ jobs:
       - name: Install dependencies
         run: pip install requests "algoliasearch>=3,<4"
 
+      - name: Debug endpoints
+        run: |
+          echo "--- data_categories (post types) ---"
+          curl -s "https://learn.everyavenue.com/api/v2/data_categories/get/1" \
+            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6"
+          echo ""
+          echo "--- user search empty body ---"
+          curl -s -X POST "https://learn.everyavenue.com/api/v2/user/search" \
+            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" \
+            -H "Content-Type: application/json" \
+            -d '{"output_type":"array","action":"search","limit":2}'
+          echo ""
+          echo "--- data_posts search with data_id 1 ---"
+          curl -s -X POST "https://learn.everyavenue.com/api/v2/data_posts/search" \
+            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" \
+            -H "Content-Type: application/json" \
+            -d '{"output_type":"array","action":"search","data_id":"1","limit":2}'
+          echo ""
+
       - name: Run sync
         env:
           BD_API_KEY:         ${{ secrets.BD_API_KEY }}
