@@ -144,8 +144,9 @@ def get_all_active_users(total_members: int) -> list:
 
 def get_user_listings(user_id: str) -> list:
     """
-    GET portfolio groups for a user WITHOUT page/limit params — these cause 400.
-    If next_page cursor is returned, use it to paginate.
+    GET portfolio groups for a user.
+    BD returns 400 (not empty array) when a user has no listings — treat as empty.
+    Uses next_page cursor for pagination if needed.
     """
     all_listings = []
     page_cursor  = None
@@ -158,7 +159,12 @@ def get_user_listings(user_id: str) -> list:
         if page_cursor:
             params["page"] = page_cursor
 
-        data = bd_get("/users_portfolio_groups/get", params=params)
+        try:
+            data = bd_get("/users_portfolio_groups/get", params=params)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                break   # BD returns 400 when user has no listings
+            raise
         msg  = data.get("message") or []
 
         if not isinstance(msg, list) or not msg:
@@ -341,7 +347,10 @@ def main():
             ]
             for listing in published:
                 listing_records.append(enforce_byte_cap(build_listing_record(listing)))
-            print(f"  {len(published)} published listings")
+            if published:
+                print(f"  {len(published)} published listings")
+            else:
+                print(f"  no listings")
         except Exception as e:
             print(f"  listings error: {e}")
 
