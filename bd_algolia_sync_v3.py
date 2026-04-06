@@ -119,9 +119,11 @@ def get_all_active_users(total_members: int) -> list:
 
             if user:
                 consecutive_misses = 0
-                if str(user.get("active", "")) == ACTIVE_USER:
+                name   = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+                sub_id = str(user.get("subscription_id", ""))
+                if str(user.get("active", "")) == ACTIVE_USER and name and sub_id not in ("4", "7"):
                     users.append(user)
-                    print(f"  Found user_id={uid}: {user.get('first_name','')} {user.get('last_name','')}")
+                    print(f"  Found user_id={uid}: {name} (sub={sub_id})")
                     if len(users) >= total_members:
                         print(f"  Reached total_members={total_members}, stopping probe")
                         break
