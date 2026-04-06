@@ -21,15 +21,21 @@ jobs:
 
       - name: Debug
         run: |
-          echo "--- user GET no property ---"
-          curl -s "https://learn.everyavenue.com/api/v2/user/get?limit=2&page=1" \
+          echo "--- user/get by known user_id=32 ---"
+          curl -s "https://learn.everyavenue.com/api/v2/user/get?property=user_id&property_value=32" \
             -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" | head -c 2000
           echo ""
-          echo "--- portfolio_groups search data_id=6 ---"
+          echo "--- portfolio_groups search NO data_id ---"
           curl -s -X POST "https://learn.everyavenue.com/api/v2/users_portfolio_groups/search" \
             -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" \
             -H "Content-Type: application/json" \
-            -d '{"output_type":"array","action":"search","data_id":"6","q":"","limit":2,"page":1}'
+            -d '{"output_type":"array","action":"search","q":"","limit":2,"page":1}'
+          echo ""
+          echo "--- data_posts search NO data_id ---"
+          curl -s -X POST "https://learn.everyavenue.com/api/v2/data_posts/search" \
+            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" \
+            -H "Content-Type: application/json" \
+            -d '{"output_type":"array","action":"search","q":"","limit":2,"page":1}'
           echo ""
 
       - name: Run sync
