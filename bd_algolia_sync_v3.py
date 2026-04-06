@@ -28,9 +28,8 @@ ALGOLIA_WRITE_KEY  = os.environ["ALGOLIA_WRITE_KEY"]
 ALGOLIA_INDEX_NAME = os.environ.get("ALGOLIA_INDEX_NAME", "educators")
 
 # BD passes the API key as a query param — confirm in your portal if it differs
-BD_PARAMS  = {"api_key": BD_API_KEY}
-BD_HEADERS = {"Content-Type": "application/json"}
-
+BD_PARAMS  = {}
+BD_HEADERS = {"Content-Type": "application/json", "X-API-KEY": BD_API_KEY}
 MAX_RECORD_BYTES = 9_500   # Algolia hard cap is 10 000; leave headroom
 BIO_CHAR_LIMIT   = 500     # keep parity with v2.2 truncation behaviour
 SNIPPET_CHARS    = 205     # listing card preview length in the widget
