@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-bd_algolia_sync.py  v3.9
+bd_algolia_sync.py  v4.0
 Syncs educators and listings to Algolia via BD API v2.
 
-Based on official BD API documentation:
-  - POST /api/v2/user/search with output_type=array returns JSON user array
-  - GET /api/v2/user/get?property=user_id&property_value={id} returns full user data
-  - GET /api/v2/users_portfolio_groups/get?property=user_id&property_value={id}
-    returns all listings for a user
+Key findings from debugging:
+  - user/search HTML mode works but page param in body is ignored (always returns page 1)
+  - user/search array mode returns empty with blank q
+  - user/get by user_id works reliably for all users
+  - users_portfolio_groups/get works WITHOUT page/limit params; returns 400 with them
+  - Pagination for portfolio_groups uses next_page cursor token, not numeric pages
 
-Flow:
-  1. POST user/search (output_type=array) to get all user_ids
-  2. GET user/get for each user_id to get full profile data (about_me, photos, etc)
-  3. GET users_portfolio_groups/get for each user_id to get their listings
+Strategy:
+  1. POST user/search (HTML) to get total_members count
+  2. Probe user IDs 1..MAX sequentially via user/get to find all active users
+     (stops once we've found total_members active users)
+  3. For each user: GET users_portfolio_groups (no extra params) for their listings
   4. Filter listings: group_status=1, data_id=6
   5. Push all records to Algolia
 
@@ -44,9 +46,10 @@ BD_HEADERS = {
     "Content-Type": "application/json",
 }
 
-LISTING_DATA_ID = "6"   # Classes & Resources
-LISTING_STATUS  = "1"   # published
-ACTIVE_USER     = "2"   # active member
+LISTING_DATA_ID  = "6"   # Classes & Resources
+LISTING_STATUS   = "1"   # published
+ACTIVE_USER      = "2"   # active member
+MAX_USER_ID      = 300   # probe up to this ID; increase as platform grows
 
 MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
@@ -81,80 +84,100 @@ def bd_post(endpoint: str, body: dict) -> dict:
     return resp.json()
 
 
-def get_all_user_ids() -> list:
+# ── User discovery ────────────────────────────────────────────────────────────
+
+def get_total_member_count() -> int:
     """
-    POST /api/v2/user/search with output_type=array to retrieve all user_ids.
-    Paginates using page parameter and total_pages from response.
-    Returns list of user_id strings for active members only.
+    POST user/search (HTML mode) to extract total_members from the JSON envelope.
+    Even though the message body is HTML, the count is always in the JSON.
     """
-    user_ids = []
-    page = 1
-
-    while True:
-        data = bd_post("/user/search", {
-            "output_type": "array",
-            "q":           "",
-            "limit":       100,
-            "page":        page,
-        })
-
-        members = data.get("message") or []
-        if not isinstance(members, list) or not members:
-            print(f"  page {page}: no members returned")
-            break
-
-        active = [m for m in members if str(m.get("active", "")) == ACTIVE_USER]
-        user_ids.extend([str(m["user_id"]) for m in active if m.get("user_id")])
-        print(f"  page {page}: {len(members)} members, {len(active)} active")
-
-        total_pages = int(data.get("total_pages") or 1)
-        if page >= total_pages:
-            break
-        page += 1
-        time.sleep(0.5)
-
-    return user_ids
+    try:
+        data = bd_post("/user/search", {"limit": 1})
+        return int(data.get("total_members") or 0)
+    except Exception as e:
+        print(f"  Could not get member count: {e}")
+        return MAX_USER_ID   # fall back to probing everything
 
 
-def get_user(user_id: str) -> dict:
-    """GET full user profile including about_me, search_description, photos."""
-    data = bd_get("/user/get", params={
-        "property":       "user_id",
-        "property_value": user_id,
-    })
-    msg = data.get("message") or []
-    return msg[0] if isinstance(msg, list) and msg else {}
+def get_all_active_users(total_members: int) -> list:
+    """
+    Probe user IDs sequentially from 1 to MAX_USER_ID.
+    Returns list of full user dicts for active members (active=2).
+    Stops early once we've found total_members active users.
+    """
+    users = []
+    consecutive_misses = 0
 
+    for uid in range(1, MAX_USER_ID + 1):
+        try:
+            data = bd_get("/user/get", params={
+                "property":       "user_id",
+                "property_value": str(uid),
+            })
+            msg  = data.get("message") or []
+            user = msg[0] if isinstance(msg, list) and msg else None
+
+            if user:
+                consecutive_misses = 0
+                if str(user.get("active", "")) == ACTIVE_USER:
+                    users.append(user)
+                    print(f"  Found user_id={uid}: {user.get('first_name','')} {user.get('last_name','')}")
+                    if len(users) >= total_members:
+                        print(f"  Reached total_members={total_members}, stopping probe")
+                        break
+            else:
+                consecutive_misses += 1
+                # Stop after 50 consecutive misses once we have some users
+                if len(users) > 0 and consecutive_misses >= 50:
+                    print(f"  50 consecutive misses after finding {len(users)} users, stopping")
+                    break
+
+        except Exception as e:
+            consecutive_misses += 1
+
+        time.sleep(0.25)   # stay well under 100 req/min
+
+    return users
+
+
+# ── Listing fetcher ───────────────────────────────────────────────────────────
 
 def get_user_listings(user_id: str) -> list:
     """
-    GET all portfolio groups (listings) for a user.
-    Paginates using next_page cursor from response.
+    GET portfolio groups for a user WITHOUT page/limit params — these cause 400.
+    If next_page cursor is returned, use it to paginate.
     """
-    listings = []
-    page = 1
+    all_listings = []
+    page_cursor  = None
 
     while True:
-        data = bd_get("/users_portfolio_groups/get", params={
+        params = {
             "property":       "user_id",
             "property_value": user_id,
-            "page":           page,
-            "limit":          100,
-        })
+        }
+        if page_cursor:
+            params["page"] = page_cursor
 
-        msg = data.get("message") or []
+        data = bd_get("/users_portfolio_groups/get", params=params)
+        msg  = data.get("message") or []
+
         if not isinstance(msg, list) or not msg:
             break
 
-        listings.extend(msg)
+        all_listings.extend(msg)
 
+        # Paginate using next_page cursor (BD uses cursor tokens, not page numbers)
+        next_page   = data.get("next_page")
         total_pages = int(data.get("total_pages") or 1)
-        if page >= total_pages:
-            break
-        page += 1
-        time.sleep(0.3)
+        current     = int(data.get("current_page") or 1)
 
-    return listings
+        if next_page and current < total_pages:
+            page_cursor = next_page
+            time.sleep(0.3)
+        else:
+            break
+
+    return all_listings
 
 
 # ── Text utilities ────────────────────────────────────────────────────────────
@@ -192,7 +215,6 @@ def build_educator_record(user: dict) -> dict:
     uid = str(user.get("user_id", ""))
     bio = strip_html(user.get("about_me") or "")[:BIO_CHAR_LIMIT]
 
-    # Profile photo — may be a relative path or full URL
     profile_photo = (user.get("profile_photo") or "").strip()
     if profile_photo and not profile_photo.startswith("http"):
         profile_photo = f"{BD_BASE}/{profile_photo.lstrip('/')}"
@@ -235,7 +257,6 @@ def build_listing_record(listing: dict) -> dict:
     snippet     = description[:SNIPPET_CHARS]
     tags        = resolve_tags(listing.get("post_tags", ""))
 
-    # Thumbnail from nested users_portfolio
     thumbnail = ""
     portfolio = listing.get("users_portfolio")
     if isinstance(portfolio, dict):
@@ -245,7 +266,6 @@ def build_listing_record(listing: dict) -> dict:
             or ""
         )
 
-    # Educator location from nested user object
     city = state = country = ""
     nested_user = listing.get("user")
     if isinstance(nested_user, dict):
@@ -291,30 +311,27 @@ def main():
     client = SearchClient.create(ALGOLIA_APP_ID, ALGOLIA_WRITE_KEY)
     index  = client.init_index(ALGOLIA_INDEX_NAME)
 
-    # Step 1: Get all active user IDs via POST user/search
-    print("Fetching active user IDs…")
-    user_ids = get_all_user_ids()
-    # Deduplicate
-    user_ids = list(dict.fromkeys(user_ids))
-    print(f"  {len(user_ids)} active users found\n")
+    # Step 1: Get total member count
+    print("Getting total member count…")
+    total_members = get_total_member_count()
+    print(f"  {total_members} total members on platform\n")
+
+    # Step 2: Probe sequential user IDs to find all active members
+    print(f"Probing user IDs 1-{MAX_USER_ID} for active members…")
+    users = get_all_active_users(total_members)
+    print(f"\n  {len(users)} active educators found\n")
 
     educator_records = []
     listing_records  = []
 
-    # Step 2: For each user, fetch full profile + listings
-    for i, uid in enumerate(user_ids, 1):
-        print(f"[{i}/{len(user_ids)}] user_id={uid}")
-
-        # Full profile
-        user = get_user(uid)
-        if not user:
-            print(f"  user/get returned nothing, skipping")
-            time.sleep(0.3)
-            continue
+    # Step 3: Build records + fetch listings for each user
+    for i, user in enumerate(users, 1):
+        uid  = str(user.get("user_id", ""))
+        name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
+        print(f"[{i}/{len(users)}] {name} (user_id={uid})")
 
         educator_records.append(enforce_byte_cap(build_educator_record(user)))
 
-        # Listings
         try:
             all_listings = get_user_listings(uid)
             published = [
@@ -324,16 +341,14 @@ def main():
             ]
             for listing in published:
                 listing_records.append(enforce_byte_cap(build_listing_record(listing)))
-            print(f"  OK — {len(published)} published listings")
+            print(f"  {len(published)} published listings")
         except Exception as e:
             print(f"  listings error: {e}")
-
-        time.sleep(0.4)
 
     print(f"\n{len(educator_records)} educator records")
     print(f"{len(listing_records)} listing records")
 
-    # Step 3: Push to Algolia
+    # Step 4: Push to Algolia
     all_records = educator_records + listing_records
     print(f"\nPushing {len(all_records)} records to '{ALGOLIA_INDEX_NAME}'…")
 
