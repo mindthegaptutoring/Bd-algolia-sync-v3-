@@ -1,0 +1,28 @@
+name: BD Algolia Sync
+
+on:
+  workflow_dispatch:  # manual trigger + cron-job.org webhook
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests algoliasearch
+
+      - name: Run sync
+        env:
+          BD_API_KEY:         ${{ secrets.BD_API_KEY }}
+          ALGOLIA_APP_ID:     ${{ secrets.ALGOLIA_APP_ID }}
+          ALGOLIA_WRITE_KEY:  ${{ secrets.ALGOLIA_WRITE_KEY }}
+          ALGOLIA_INDEX_NAME: ${{ secrets.ALGOLIA_INDEX_NAME }}
+        run: python bd_algolia_sync_v3.py
