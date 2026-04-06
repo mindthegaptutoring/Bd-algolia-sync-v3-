@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-bd_algolia_sync.py  v3.1
+bd_algolia_sync.py  v3.2
 Syncs educators (users_data) and listings (data_posts) to Algolia
 via the BD API v2 — no HTML scraping.
+
+Uses GET endpoints with property/property_value params and limit/page pagination.
 
 GitHub Actions secrets required:
   BD_API_KEY
@@ -27,21 +29,19 @@ ALGOLIA_WRITE_KEY  = os.environ["ALGOLIA_WRITE_KEY"]
 ALGOLIA_INDEX_NAME = os.environ.get("ALGOLIA_INDEX_NAME", "educators")
 
 BD_HEADERS = {
-    "Content-Type": "application/json",
     "X-Api-Key": BD_API_KEY,
 }
 
 MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
 SNIPPET_CHARS    = 205
-
-ACTIVE_USER = 2   # BD enum: 2 = active member
-ACTIVE_POST = 1   # BD enum: 1 = active post
+PAGE_LIMIT       = 100   # BD max per page; stay under 100 req/min
 
 
 # ── BD API helpers ────────────────────────────────────────────────────────────
 
 def bd_get(endpoint: str, params: dict = None) -> dict:
+    """Single GET request to BD API."""
     resp = requests.get(
         f"{BD_BASE_URL}{endpoint}",
         headers=BD_HEADERS,
@@ -49,47 +49,56 @@ def bd_get(endpoint: str, params: dict = None) -> dict:
         timeout=30,
     )
     resp.raise_for_status()
+    # BD returns empty body for some endpoints — handle gracefully
+    if not resp.text.strip():
+        return {}
     return resp.json()
 
 
-def bd_post(endpoint: str, body: dict) -> dict:
-    resp = requests.post(
-        f"{BD_BASE_URL}{endpoint}",
-        headers=BD_HEADERS,
-        json=body,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def bd_search_all(endpoint: str, filters: dict, per_page: int = 100) -> list:
-    """Paginate through a BD search endpoint and return all results."""
+def bd_get_all(endpoint: str, params: dict = None) -> list:
+    """
+    Paginate through a BD GET endpoint using limit/page params.
+    Returns all records across all pages.
+    """
     results = []
     page = 1
+    base_params = params or {}
+
     while True:
-        body = {**filters, "page": page, "per_page": per_page}
-        data = bd_post(endpoint, body)
-        records = data.get("data") or data.get("results") or []
+        paged_params = {**base_params, "limit": PAGE_LIMIT, "page": page}
+        data = bd_get(endpoint, paged_params)
+
+        # BD wraps results — try common wrapper keys
+        records = (
+            data.get("data")
+            or data.get("results")
+            or data.get("members")
+            or data.get("posts")
+            or []
+        )
+
         if not records:
             break
+
         results.extend(records)
-        if len(records) < per_page:
-            break
+
+        if len(records) < PAGE_LIMIT:
+            break   # last page
+
         page += 1
-        time.sleep(0.25)
+        time.sleep(0.7)   # stay well under 100 req/min
+
     return results
 
 
-# ── Tag helpers (optional — skipped gracefully if endpoints return nothing) ───
+# ── Tag helpers (optional — skipped gracefully if unavailable) ────────────────
 
 def fetch_tag_lookup() -> dict:
-    """Returns {tag_id_str: tag_label}. Empty dict if endpoint unavailable."""
     try:
         data = bd_get("/tags_data")
         raw  = data.get("data") or []
         if not raw:
-            print("  tags_data returned empty — skipping tag lookup")
+            print("  tags_data empty — skipping")
             return {}
         return {
             str(t.get("id") or t.get("tag_id")): (
@@ -103,12 +112,11 @@ def fetch_tag_lookup() -> dict:
 
 
 def fetch_rel_tags(object_type: str, tag_lookup: dict) -> dict:
-    """Returns {object_id_str: [tag_label, ...]}. Empty dict if unavailable."""
     try:
         data = bd_get("/rel_tags", params={"object_type": object_type})
         raw  = data.get("data") or []
         if not raw:
-            print(f"  rel_tags ({object_type}) returned empty — skipping")
+            print(f"  rel_tags ({object_type}) empty — skipping")
             return {}
         tag_map = {}
         for rel in raw:
@@ -127,7 +135,6 @@ def fetch_rel_tags(object_type: str, tag_lookup: dict) -> dict:
 
 
 def resolve_member_tags(member_tags_str: str, tag_lookup: dict) -> list:
-    """Convert BD's comma-separated tag ID string to labels."""
     if not member_tags_str or not tag_lookup:
         return []
     ids = [t.strip() for t in member_tags_str.split(",") if t.strip()]
@@ -236,7 +243,7 @@ def main():
     client = SearchClient.create(ALGOLIA_APP_ID, ALGOLIA_WRITE_KEY)
     index  = client.init_index(ALGOLIA_INDEX_NAME)
 
-    # Tags — optional, skipped gracefully if unavailable
+    # Tags — optional
     print("Fetching tag definitions…")
     tag_lookup = fetch_tag_lookup()
     print(f"  {len(tag_lookup)} tags loaded")
@@ -245,9 +252,9 @@ def main():
     educator_tags = fetch_rel_tags("user", tag_lookup)
     listing_tags  = fetch_rel_tags("post", tag_lookup)
 
-    # Educators
+    # Educators — GET all active members
     print("Fetching active educators…")
-    users = bd_search_all("/user/search", filters={"active": ACTIVE_USER})
+    users = bd_get_all("/user/get", params={"property": "active", "property_value": "2"})
     print(f"  {len(users)} educators found")
 
     educator_records = [
@@ -255,9 +262,9 @@ def main():
         for u in users
     ]
 
-    # Listings
+    # Listings — GET all active posts
     print("Fetching active listings…")
-    posts = bd_search_all("/data_posts/search", filters={"active": ACTIVE_POST})
+    posts = bd_get_all("/data_posts/get", params={"property": "active", "property_value": "1"})
     print(f"  {len(posts)} listings found")
 
     listing_records = [
