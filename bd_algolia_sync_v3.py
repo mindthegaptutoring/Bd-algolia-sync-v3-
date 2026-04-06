@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-bd_algolia_sync.py  v3.7
+bd_algolia_sync.py  v3.8
 Syncs educators and listings to Algolia via BD API v2.
 
-Strategy (confirmed working through debug):
-  1. Fetch user/search HTML pages, extract profile filenames via regex
-  2. For each filename: call user/get for full profile JSON
-  3. For each active user: call users_portfolio_groups/get for their listings
-  4. Filter listings: group_status=1, data_id=6 (Classes & Resources)
-  5. Push educators + listings to Algolia
+Strategy:
+  1. Fetch user/search pages (JSON-wrapped HTML), parse JSON first,
+     then extract member profile filenames from the decoded HTML string.
+  2. For each filename: call user/get for full profile JSON.
+  3. For each active user: call users_portfolio_groups/get for listings.
+  4. Filter listings: group_status=1, data_id=6 (Classes & Resources).
+  5. Push educators + listings to Algolia.
 
 GitHub Actions secrets required:
   BD_API_KEY
@@ -26,26 +27,23 @@ from algoliasearch.search_client import SearchClient
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-BD_BASE          = "https://learn.everyavenue.com"
-BD_BASE_URL      = f"{BD_BASE}/api/v2"
-BD_API_KEY       = os.environ["BD_API_KEY"]
-ALGOLIA_APP_ID   = os.environ["ALGOLIA_APP_ID"]
+BD_BASE            = "https://learn.everyavenue.com"
+BD_BASE_URL        = f"{BD_BASE}/api/v2"
+BD_API_KEY         = os.environ["BD_API_KEY"]
+ALGOLIA_APP_ID     = os.environ["ALGOLIA_APP_ID"]
 ALGOLIA_WRITE_KEY  = os.environ["ALGOLIA_WRITE_KEY"]
 ALGOLIA_INDEX_NAME = os.environ.get("ALGOLIA_INDEX_NAME", "educators")
 
-BD_HEADERS = {
-    "X-Api-Key": BD_API_KEY,
-}
+BD_HEADERS = {"X-Api-Key": BD_API_KEY}
 
-LISTING_DATA_ID  = "6"    # Classes & Resources
-LISTING_STATUS   = "1"    # published
-ACTIVE_USER      = "2"    # active member
+LISTING_DATA_ID = "6"   # Classes & Resources
+LISTING_STATUS  = "1"   # published
+ACTIVE_USER     = "2"   # active member
 
 MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
 SNIPPET_CHARS    = 205
 
-# URL path prefixes that are NOT member profile filenames
 NON_PROFILE_PREFIXES = (
     "api/", "pictures/", "photos/", "images/", "about/",
     "checkout/", "contact/", "search/", "classes-and-resources",
@@ -69,13 +67,9 @@ def bd_get(endpoint: str, params: dict = None) -> dict:
 
 
 def bd_get_all_for_user(endpoint: str, user_id: str) -> list:
-    """
-    Fetch all records for a given user_id, handling pagination.
-    Uses total_pages from the response to iterate.
-    """
+    """Fetch all records for a user_id, handling pagination."""
     results = []
     page = 1
-
     while True:
         data = bd_get(endpoint, params={
             "property":       "user_id",
@@ -83,33 +77,29 @@ def bd_get_all_for_user(endpoint: str, user_id: str) -> list:
             "page":           page,
             "limit":          100,
         })
-
         msg = data.get("message") or []
         if not isinstance(msg, list) or not msg:
             break
-
         results.extend(msg)
-
         total_pages = int(data.get("total_pages") or 1)
         if page >= total_pages:
             break
         page += 1
         time.sleep(0.4)
-
     return results
 
 
-# ── User ID discovery ─────────────────────────────────────────────────────────
+# ── User discovery ────────────────────────────────────────────────────────────
 
 def get_profile_filenames() -> list:
     """
-    Fetch all pages of user/search HTML and extract unique member profile
-    filenames. BD has no JSON listing endpoint for all users, so we parse
-    the schema.org markup to get profile URLs.
+    Fetch all pages of user/search (returns JSON-wrapped HTML).
+    Parse the JSON, extract the HTML from the 'message' field,
+    then regex-extract member profile filenames.
 
-    Profile URLs look like:
-      https://learn.everyavenue.com/canada/toronto/1-on-1-teaching/kt-tt
-    The filename is the path without the domain:
+    Profile URLs in the decoded HTML look like:
+      href="https://learn.everyavenue.com/canada/toronto/1-on-1-teaching/kt-tt"
+    Filename = path after domain:
       canada/toronto/1-on-1-teaching/kt-tt
     """
     filenames = set()
@@ -122,9 +112,18 @@ def get_profile_filenames() -> list:
             params={"page": page, "limit": 100},
             timeout=30,
         )
-        html = resp.text
+        resp.raise_for_status()
 
-        # Extract all absolute hrefs from the HTML
+        # Parse as JSON — the HTML lives in response["message"]
+        data = resp.json()
+        html = data.get("message", "")
+        total_pages = int(data.get("total_pages") or 1)
+
+        if not isinstance(html, str):
+            print(f"  page {page}: unexpected message type {type(html)}")
+            break
+
+        # Extract member profile hrefs from the decoded HTML
         raw_hrefs = re.findall(
             rf'href="{re.escape(BD_BASE)}/([^"#]+)"',
             html,
@@ -132,22 +131,15 @@ def get_profile_filenames() -> list:
 
         for href in raw_hrefs:
             href = href.strip().rstrip("/")
-            # Skip non-profile paths
             if any(href.startswith(p) for p in NON_PROFILE_PREFIXES):
                 continue
-            # Skip connect/message sub-pages
             if href.endswith("/connect") or href.endswith("/message"):
                 continue
-            # Profile paths have at least 2 segments (e.g. pro/TOKEN or country/city/cat/name)
             if "/" not in href:
                 continue
             filenames.add(href)
 
-        # Total pages is embedded as JSON at the end of the HTML response
-        total_match = re.search(r'"total_pages":(\d+)', html)
-        total_pages = int(total_match.group(1)) if total_match else 1
-
-        print(f"  HTML page {page}/{total_pages}: found {len(raw_hrefs)} hrefs")
+        print(f"  HTML page {page}/{total_pages}: {len(raw_hrefs)} hrefs, {len(filenames)} unique profiles so far")
 
         if page >= total_pages:
             break
@@ -192,6 +184,10 @@ def build_educator_record(user: dict) -> dict:
     uid = str(user.get("user_id", ""))
     bio = strip_html(user.get("about_me") or "")[:BIO_CHAR_LIMIT]
 
+    profile_photo = user.get("profile_photo") or ""
+    if profile_photo and not profile_photo.startswith("http"):
+        profile_photo = f"{BD_BASE}/{profile_photo}"
+
     record = {
         "objectID":           f"educator_{uid}",
         "type":               "educator",
@@ -206,18 +202,12 @@ def build_educator_record(user: dict) -> dict:
         "website":            (user.get("website") or "").strip(),
         "instagram":          (user.get("instagram") or "").strip(),
         "profile_url":        f"{BD_BASE}/{user.get('filename', '')}".strip(),
+        "profile_photo":      profile_photo,
         "active":             user.get("active"),
         "signup_date":        user.get("signup_date", ""),
         "listing_type":       (user.get("listing_type") or "").strip(),
     }
 
-    # Profile photo
-    profile_photo = user.get("profile_photo") or ""
-    if profile_photo and not profile_photo.startswith("http"):
-        profile_photo = f"{BD_BASE}/{profile_photo}"
-    record["profile_photo"] = profile_photo
-
-    # Geo
     lat = user.get("lat")
     lon = user.get("lon")
     if lat and lon:
@@ -232,12 +222,10 @@ def build_educator_record(user: dict) -> dict:
 def build_listing_record(listing: dict) -> dict:
     gid         = str(listing.get("group_id") or "")
     title       = (listing.get("group_name") or "").strip()
-    raw_desc    = listing.get("group_desc") or ""
-    description = strip_html(raw_desc)
+    description = strip_html(listing.get("group_desc") or "")
     snippet     = description[:SNIPPET_CHARS]
     tags        = resolve_tags(listing.get("post_tags", ""))
 
-    # Thumbnail from nested users_portfolio
     thumbnail = ""
     portfolio = listing.get("users_portfolio")
     if isinstance(portfolio, dict):
@@ -247,7 +235,6 @@ def build_listing_record(listing: dict) -> dict:
             or ""
         )
 
-    # Educator location from nested user
     city = state = country = ""
     nested_user = listing.get("user")
     if isinstance(nested_user, dict):
@@ -256,34 +243,32 @@ def build_listing_record(listing: dict) -> dict:
         country = (nested_user.get("country_ln") or "").strip()
 
     record = {
-        "objectID":        f"listing_{gid}",
-        "type":            "listing",
-        "group_id":        gid,
-        "user_id":         str(listing.get("user_id") or ""),
-        "title":           title,
-        "description":     description,
-        "snippet":         snippet,
-        "thumbnail":       thumbnail,
-        "tags":            tags,
-        "group_category":  (listing.get("group_category") or "").strip(),
-        "listing_url":     f"{BD_BASE}/{listing.get('group_filename', '')}".strip(),
-        "post_link":       (listing.get("post_link") or "").strip(),
-        "post_location":   (listing.get("post_location") or "").strip(),
-        "class_rates":     (listing.get("class_rates") or "").strip(),
-        "grades":          resolve_tags(listing.get("grades", "")),
-        "delivery_method": (listing.get("delivery_method") or "").strip().rstrip("_"),
-        "format":          (listing.get("format") or "").strip(),
-        "duration":        (listing.get("duration") or "").strip(),
-        "scheduling":      (listing.get("scheduling") or "").strip(),
-        "prerequisites":   (listing.get("prerequisites") or "").strip(),
-        "cohort_size":     listing.get("cohort_size"),
+        "objectID":         f"listing_{gid}",
+        "type":             "listing",
+        "group_id":         gid,
+        "user_id":          str(listing.get("user_id") or ""),
+        "title":            title,
+        "description":      description,
+        "snippet":          snippet,
+        "thumbnail":        thumbnail,
+        "tags":             tags,
+        "group_category":   (listing.get("group_category") or "").strip(),
+        "listing_url":      f"{BD_BASE}/{listing.get('group_filename', '')}".strip(),
+        "post_link":        (listing.get("post_link") or "").strip(),
+        "post_location":    (listing.get("post_location") or "").strip(),
+        "class_rates":      (listing.get("class_rates") or "").strip(),
+        "grades":           resolve_tags(listing.get("grades", "")),
+        "delivery_method":  (listing.get("delivery_method") or "").strip().rstrip("_"),
+        "format":           (listing.get("format") or "").strip(),
+        "duration":         (listing.get("duration") or "").strip(),
+        "scheduling":       (listing.get("scheduling") or "").strip(),
+        "prerequisites":    (listing.get("prerequisites") or "").strip(),
+        "cohort_size":      listing.get("cohort_size"),
         "listing_category": (listing.get("listing_category") or "").strip(),
-        "group_status":    listing.get("group_status"),
-        "last_updated":    listing.get("revision_timestamp", ""),
-        # Educator location (for filtering/display)
-        "city":            city,
-        "state":           state,
-        "country":         country,
+        "last_updated":     listing.get("revision_timestamp", ""),
+        "city":             city,
+        "state":            state,
+        "country":          country,
     }
 
     return record
@@ -295,45 +280,42 @@ def main():
     client = SearchClient.create(ALGOLIA_APP_ID, ALGOLIA_WRITE_KEY)
     index  = client.init_index(ALGOLIA_INDEX_NAME)
 
-    # ── Step 1: Discover all member profile filenames from HTML ───────────────
-    print("Discovering member profile filenames from HTML pages…")
+    # Step 1: Discover member profile filenames
+    print("Discovering member profiles from HTML pages…")
     filenames = get_profile_filenames()
-    print(f"  {len(filenames)} unique profile paths found")
+    print(f"  {len(filenames)} unique profile paths found\n")
 
-    # ── Step 2: Fetch JSON for each user + their listings ─────────────────────
+    # Step 2: Fetch JSON for each user + their listings
     educator_records = []
     listing_records  = []
     seen_user_ids    = set()
 
     for i, filename in enumerate(filenames, 1):
-        print(f"  [{i}/{len(filenames)}] {filename}")
+        print(f"[{i}/{len(filenames)}] {filename}")
 
-        # Get user JSON
         try:
             user_data = bd_get("/user/get", params={
                 "property":       "filename",
                 "property_value": filename,
             })
-            msg = user_data.get("message") or []
+            msg  = user_data.get("message") or []
             user = msg[0] if isinstance(msg, list) and msg else {}
         except Exception as e:
-            print(f"    user/get failed: {e}")
+            print(f"  user/get failed: {e}")
             continue
 
         if not user or str(user.get("active", "")) != ACTIVE_USER:
-            print(f"    skipping (inactive or not found)")
+            print(f"  skipping (inactive or not found)")
             continue
 
         uid = str(user.get("user_id", ""))
         if uid in seen_user_ids:
-            continue   # deduplicate (same user can appear under multiple URL variants)
+            print(f"  duplicate user_id={uid}, skipping")
+            continue
         seen_user_ids.add(uid)
 
-        educator_records.append(
-            enforce_byte_cap(build_educator_record(user))
-        )
+        educator_records.append(enforce_byte_cap(build_educator_record(user)))
 
-        # Get listings for this user
         try:
             all_listings = bd_get_all_for_user("/users_portfolio_groups/get", uid)
             published = [
@@ -342,19 +324,17 @@ def main():
                 and str(l.get("data_id")) == LISTING_DATA_ID
             ]
             for listing in published:
-                listing_records.append(
-                    enforce_byte_cap(build_listing_record(listing))
-                )
-            print(f"    active educator, {len(published)} listings")
+                listing_records.append(enforce_byte_cap(build_listing_record(listing)))
+            print(f"  OK — {len(published)} listings")
         except Exception as e:
-            print(f"    listings fetch failed: {e}")
+            print(f"  listings failed: {e}")
 
         time.sleep(0.4)
 
     print(f"\n{len(educator_records)} active educators")
     print(f"{len(listing_records)} published listings")
 
-    # ── Step 3: Push to Algolia ───────────────────────────────────────────────
+    # Step 3: Push to Algolia
     all_records = educator_records + listing_records
     print(f"\nPushing {len(all_records)} records to '{ALGOLIA_INDEX_NAME}'…")
 
