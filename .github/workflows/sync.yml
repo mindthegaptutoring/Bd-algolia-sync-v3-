@@ -19,11 +19,9 @@ jobs:
       - name: Install dependencies
         run: pip install requests "algoliasearch>=3,<4"
 
-      - name: Debug photo fields
-        env:
-          BD_API_KEY: ${{ secrets.BD_API_KEY }}
+      - name: Write debug script
         run: |
-          python3 - <<'PYEOF'
+          cat > /tmp/debug_photo.py << 'EOF'
 import requests, json, os
 key = os.environ["BD_API_KEY"]
 resp = requests.get(
@@ -36,7 +34,12 @@ for k, v in u.items():
     if any(x in k.lower() for x in ["photo", "image", "logo", "pic", "avatar", "cover"]):
         print(k, ":", repr(v))
 print("photos_schema:", repr(u.get("photos_schema")))
-PYEOF
+EOF
+
+      - name: Debug photo fields
+        env:
+          BD_API_KEY: ${{ secrets.BD_API_KEY }}
+        run: python3 /tmp/debug_photo.py
 
       - name: Run sync
         env:
