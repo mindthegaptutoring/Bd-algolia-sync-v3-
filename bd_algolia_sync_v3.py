@@ -326,7 +326,7 @@ def build_listing_record(listing: dict) -> dict:
         "snippet":          snippet,
         "thumbnail":        thumbnail,
         "tags":             tags,
-        "subject":          (listing.get("group_category") or "").strip(),
+        "category":         (listing.get("group_category") or "").strip(),
         "listing_url":      f"{BD_BASE}/{listing.get('group_filename', '').lstrip('/')}",
         "post_link":        (listing.get("post_link") or "").strip(),
         "post_location":    (listing.get("post_location") or "").strip(),
