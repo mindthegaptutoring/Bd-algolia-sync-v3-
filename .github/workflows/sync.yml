@@ -20,19 +20,23 @@ jobs:
         run: pip install requests "algoliasearch>=3,<4"
 
       - name: Debug photo fields
+        env:
+          BD_API_KEY: ${{ secrets.BD_API_KEY }}
         run: |
-          curl -s "https://learn.everyavenue.com/api/v2/user/get?property=user_id&property_value=43" \
-            -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" \
-            | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-msg = d.get('message', [])
-u = msg[0] if isinstance(msg, list) and msg else {}
+          python3 - <<'PYEOF'
+import requests, json, os
+key = os.environ["BD_API_KEY"]
+resp = requests.get(
+    "https://learn.everyavenue.com/api/v2/user/get",
+    headers={"X-Api-Key": key},
+    params={"property": "user_id", "property_value": "43"}
+)
+u = resp.json().get("message", [{}])[0]
 for k, v in u.items():
-    if any(x in k.lower() for x in ['photo', 'image', 'logo', 'pic', 'avatar', 'cover']):
-        print(f'{k}: {repr(v)}')
-print('photos_schema:', repr(u.get('photos_schema')))
-"
+    if any(x in k.lower() for x in ["photo", "image", "logo", "pic", "avatar", "cover"]):
+        print(k, ":", repr(v))
+print("photos_schema:", repr(u.get("photos_schema")))
+PYEOF
 
       - name: Run sync
         env:
