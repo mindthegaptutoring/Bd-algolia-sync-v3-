@@ -1,7 +1,7 @@
 name: BD Algolia Sync
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # manual trigger + cron-job.org webhook
 
 jobs:
   sync:
@@ -18,28 +18,6 @@ jobs:
 
       - name: Install dependencies
         run: pip install requests "algoliasearch>=3,<4"
-
-      - name: Write debug script
-        run: |
-          cat > /tmp/debug_photo.py << 'EOF'
-import requests, json, os
-key = os.environ["BD_API_KEY"]
-resp = requests.get(
-    "https://learn.everyavenue.com/api/v2/user/get",
-    headers={"X-Api-Key": key},
-    params={"property": "user_id", "property_value": "43"}
-)
-u = resp.json().get("message", [{}])[0]
-for k, v in u.items():
-    if any(x in k.lower() for x in ["photo", "image", "logo", "pic", "avatar", "cover"]):
-        print(k, ":", repr(v))
-print("photos_schema:", repr(u.get("photos_schema")))
-EOF
-
-      - name: Debug photo fields
-        env:
-          BD_API_KEY: ${{ secrets.BD_API_KEY }}
-        run: python3 /tmp/debug_photo.py
 
       - name: Run sync
         env:
