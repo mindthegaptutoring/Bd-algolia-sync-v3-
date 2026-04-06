@@ -137,7 +137,7 @@ def get_all_active_users(total_members: int) -> list:
         except Exception as e:
             consecutive_misses += 1
 
-        time.sleep(0.25)   # stay well under 100 req/min
+        time.sleep(0.7)    # stay under 100 req/min (probe phase)
 
     return users
 
@@ -329,16 +329,16 @@ def main():
     users = get_all_active_users(total_members)
     print(f"\n  {len(users)} active educators found\n")
 
-    educator_records = []
     listing_records  = []
 
     # Step 3: Build records + fetch listings for each user
+    print("Pausing 30s to let rate limit reset…")
+    time.sleep(30)
+
     for i, user in enumerate(users, 1):
         uid  = str(user.get("user_id", ""))
         name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
         print(f"[{i}/{len(users)}] {name} (user_id={uid})")
-
-        educator_records.append(enforce_byte_cap(build_educator_record(user)))
 
         try:
             all_listings = get_user_listings(uid)
@@ -356,18 +356,15 @@ def main():
         except Exception as e:
             print(f"  listings error: {e}")
 
-    print(f"\n{len(educator_records)} educator records")
-    print(f"{len(listing_records)} listing records")
+        time.sleep(1.2)   # stay under 100 req/min (listing phase)
 
-    # Step 4: Push to Algolia
-    all_records = educator_records + listing_records
-    print(f"\nPushing {len(all_records)} records to '{ALGOLIA_INDEX_NAME}'…")
+    print(f"\n{len(listing_records)} listing records")
 
-    BATCH = 500
-    for i in range(0, len(all_records), BATCH):
-        batch = all_records[i : i + BATCH]
-        index.save_objects(batch)
-        print(f"  Batch {i // BATCH + 1} saved ({len(batch)} records)")
+    # Step 4: Replace entire index contents atomically
+    # This removes any records that no longer exist (unpublished, deleted listings)
+    print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
+    index.replace_all_objects(listing_records)
+    print("  Index replaced.")
 
     print("Sync complete.")
 
