@@ -384,9 +384,15 @@ def main():
                 and str(l.get("data_id")) == LISTING_DATA_ID
             ]
             # Get educator profile photo from user record (not in nested listing user object)
-            educator_photo = (user.get("profile_photo") or "").strip()
-            if educator_photo and not educator_photo.startswith("http"):
-                educator_photo = BD_BASE + "/" + educator_photo.lstrip("/")
+            # profile_photo may be in photos_schema or directly on user object
+            educator_photo = ""
+            photos = user.get("photos_schema")
+            if isinstance(photos, dict):
+                raw = (photos.get("profile_photo") or photos.get("photo") or photos.get("src") or "").strip()
+            else:
+                raw = (user.get("profile_photo") or user.get("logo") or "").strip()
+            if raw:
+                educator_photo = raw if raw.startswith("http") else BD_BASE + "/" + raw.lstrip("/")
             for listing in published:
                 listing_records.append(enforce_byte_cap(build_listing_record(listing, educator_photo)))
             if published:
