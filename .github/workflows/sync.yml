@@ -21,7 +21,8 @@ jobs:
 
       - name: Debug BD API
         run: |
-          curl -v -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" "https://learn.everyavenue.com/api/v2/token/verify"
+          curl -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" "https://learn.everyavenue.com/api/v2/tags_data/get/1"
+          curl -H "X-Api-Key: 98d5e69e4f7ee03b3d92eeaf7138a1b6" -X POST "https://learn.everyavenue.com/api/v2/rel_tags" -H "Content-Type: application/json" -d '{}'
 
       - name: Run sync
         env:
