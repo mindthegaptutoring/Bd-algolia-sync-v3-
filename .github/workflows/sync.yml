@@ -18,7 +18,13 @@ jobs:
 
       - name: Install dependencies
         run: pip install requests "algoliasearch>=3,<4"
-
+      
+      - name: Debug BD API
+        env:
+          BD_API_KEY: ${{ secrets.BD_API_KEY }}
+        run: |
+          curl -v "https://learn.everyavenue.com/api/v2/token/verify?api_key=$BD_API_KEY"
+          
       - name: Run sync
         env:
           BD_API_KEY:         ${{ secrets.BD_API_KEY }}
