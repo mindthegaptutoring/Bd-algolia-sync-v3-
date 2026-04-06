@@ -177,6 +177,33 @@ def get_all_active_users(total_members: int) -> list:
     return users
 
 
+# ── Profile photo fetcher ────────────────────────────────────────────────────
+
+def get_profile_photo(user_id: str) -> str:
+    """
+    GET the profile photo URL for a user via users_photo endpoint.
+    Returns full URL or empty string.
+    """
+    try:
+        data = bd_get("/users_photo/get", params={
+            "property":       "user_id",
+            "property_value": user_id,
+        })
+        msg = data.get("message") or []
+        if isinstance(msg, list) and msg:
+            photo = msg[0]
+            # Try full URL fields first, then construct from filename
+            full_url = (photo.get("file_main_full_url") or photo.get("file_full_url") or "").strip()
+            if full_url:
+                return full_url
+            filename = (photo.get("file") or photo.get("filename") or "").strip()
+            if filename:
+                return f"{BD_BASE}/pictures/profile/{filename}"
+    except Exception:
+        pass
+    return ""
+
+
 # ── Listing fetcher ───────────────────────────────────────────────────────────
 
 def get_user_listings(user_id: str) -> list:
@@ -383,10 +410,8 @@ def main():
                 if str(l.get("group_status")) == LISTING_STATUS
                 and str(l.get("data_id")) == LISTING_DATA_ID
             ]
-            # Get educator profile photo from user record
-            educator_photo = (user.get("profile_photo") or "").strip()
-            if educator_photo and not educator_photo.startswith("http"):
-                educator_photo = BD_BASE + "/" + educator_photo.lstrip("/")
+            # Get educator profile photo from dedicated photo endpoint
+            educator_photo = get_profile_photo(uid)
             for listing in published:
                 listing_records.append(enforce_byte_cap(build_listing_record(listing, educator_photo)))
             if published:
