@@ -106,10 +106,10 @@ def get_profile_filenames() -> list:
     page = 1
 
     while True:
-        resp = requests.get(
+        resp = requests.post(
             f"{BD_BASE_URL}/user/search",
-            headers=BD_HEADERS,
-            params={"page": page, "limit": 100},
+            headers={**BD_HEADERS, "Content-Type": "application/json"},
+            json={"page": page, "limit": 100},
             timeout=30,
         )
         resp.raise_for_status()
