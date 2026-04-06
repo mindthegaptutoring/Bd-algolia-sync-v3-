@@ -343,6 +343,7 @@ def build_listing_record(listing: dict) -> dict:
         "city":             city,
         "state":            state,
         "country":          country,
+        "profile_photo":    nested_user.get("profile_photo", "") if isinstance(nested_user, dict) else "",
     }
 
     return record
