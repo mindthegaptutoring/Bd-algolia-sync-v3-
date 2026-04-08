@@ -172,7 +172,7 @@ def get_all_active_users(total_members: int) -> list:
         except Exception as e:
             consecutive_misses += 1
 
-        time.sleep(0.7)    # stay under 100 req/min (probe phase)
+        time.sleep(0.3)    # stay under 100 req/min (probe phase)
 
     return users
 
@@ -396,7 +396,7 @@ def main():
 
     # Step 3: Build records + fetch listings for each user
     print("Pausing 30s to let rate limit reset…")
-    time.sleep(30)
+    time.sleep(2)
 
     for i, user in enumerate(users, 1):
         uid  = str(user.get("user_id", ""))
@@ -421,7 +421,7 @@ def main():
         except Exception as e:
             print(f"  listings error: {e}")
 
-        time.sleep(1.2)   # stay under 100 req/min (listing phase)
+        time.sleep(0.3)   # stay under 100 req/min (listing phase)
 
     print(f"\n{len(listing_records)} listing records")
 
