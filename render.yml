@@ -1,0 +1,15 @@
+services: []
+
+cronJobs:
+  - name: bd-algolia-sync
+    schedule: "0 * * * *"   # every hour
+    command: "python bd_algolia_sync.py"
+    envVars:
+      - key: BD_API_KEY
+        sync: false
+      - key: ALGOLIA_APP_ID
+        sync: false
+      - key: ALGOLIA_WRITE_KEY
+        sync: false
+      - key: ALGOLIA_INDEX_NAME
+        sync: false
