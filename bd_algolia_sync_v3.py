@@ -334,7 +334,7 @@ def main():
     listing_records = []
 
     print("Pausing 30s to let rate limit reset…")
-    time.sleep(1)
+    time.sleep(5)
 
     for i, user in enumerate(users, 1):
         uid  = str(user.get("user_id", ""))
