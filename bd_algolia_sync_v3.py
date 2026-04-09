@@ -2,27 +2,6 @@
 """
 bd_algolia_sync.py  v4.0
 Syncs educators and listings to Algolia via BD API v2.
-
-Key findings from debugging:
-  - user/search HTML mode works but page param in body is ignored (always returns page 1)
-  - user/search array mode returns empty with blank q
-  - user/get by user_id works reliably for all users
-  - users_portfolio_groups/get works WITHOUT page/limit params; returns 400 with them
-  - Pagination for portfolio_groups uses next_page cursor token, not numeric pages
-
-Strategy:
-  1. POST user/search (HTML) to get total_members count
-  2. Probe user IDs 1..MAX sequentially via user/get to find all active users
-     (stops once we've found total_members active users)
-  3. For each user: GET users_portfolio_groups (no extra params) for their listings
-  4. Filter listings: group_status=1, data_id=6
-  5. Push all records to Algolia
-
-GitHub Actions secrets required:
-  BD_API_KEY
-  ALGOLIA_APP_ID
-  ALGOLIA_WRITE_KEY
-  ALGOLIA_INDEX_NAME  (optional, defaults to "educators")
 """
 
 import os
@@ -55,15 +34,15 @@ MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
 SNIPPET_CHARS    = 205
 
-# ── Field value mappings (raw BD values → display labels) ────────────────────
+# ── Field value mappings ─────────────────────────────────────────────────────
 
 FORMAT_MAP = {
     "1": "1-on-1 Teaching",
-    "6": "Coaching & Mentoring",
+    "2": "Tutoring",
+    "3": "Self Paced Classes",
     "4": "Online Group Classes",
     "5": "Resources",
-    "3": "Self Paced Classes",
-    "2": "Tutoring",
+    "6": "Coaching & Mentoring",
 }
 
 GRADE_MAP = {
@@ -85,11 +64,10 @@ SCHEDULING_MAP = {
 }
 
 DELIVERY_MAP = {
-    "synchronous":             "Live, scheduled sessions",
-    "asynchronous":            "Self-paced, learn anytime",
+    "synchronous":              "Live, scheduled sessions",
+    "asynchronous":             "Self-paced, learn anytime",
     "synchronous_asynchronous": "Hybrid, mix of both",
 }
-
 
 # ── BD API helpers ────────────────────────────────────────────────────────────
 
@@ -105,7 +83,6 @@ def bd_get(endpoint: str, params: dict = None) -> dict:
         return {}
     return resp.json()
 
-
 def bd_post(endpoint: str, body: dict) -> dict:
     resp = requests.post(
         f"{BD_BASE_URL}{endpoint}",
@@ -118,28 +95,16 @@ def bd_post(endpoint: str, body: dict) -> dict:
         return {}
     return resp.json()
 
-
 # ── User discovery ────────────────────────────────────────────────────────────
 
 def get_total_member_count() -> int:
-    """
-    POST user/search (HTML mode) to extract total_members from the JSON envelope.
-    Even though the message body is HTML, the count is always in the JSON.
-    """
     try:
         data = bd_post("/user/search", {"limit": 1})
         return int(data.get("total_members") or 0)
-    except Exception as e:
-        print(f"  Could not get member count: {e}")
-        return MAX_USER_ID   # fall back to probing everything
-
+    except Exception:
+        return MAX_USER_ID
 
 def get_all_active_users(total_members: int) -> list:
-    """
-    Probe user IDs sequentially from 1 to MAX_USER_ID.
-    Returns list of full user dicts for active members (active=2).
-    Stops early once we've found total_members active users.
-    """
     users = []
     consecutive_misses = 0
 
@@ -158,32 +123,23 @@ def get_all_active_users(total_members: int) -> list:
                 sub_id = str(user.get("subscription_id", ""))
                 if str(user.get("active", "")) == ACTIVE_USER and name and sub_id not in ("4", "7"):
                     users.append(user)
-                    print(f"  Found user_id={uid}: {name} (sub={sub_id})")
                     if len(users) >= total_members:
-                        print(f"  Reached total_members={total_members}, stopping probe")
                         break
             else:
                 consecutive_misses += 1
-                # Stop after 50 consecutive misses once we have some users
                 if len(users) > 0 and consecutive_misses >= 50:
-                    print(f"  50 consecutive misses after finding {len(users)} users, stopping")
                     break
 
-        except Exception as e:
+        except Exception:
             consecutive_misses += 1
 
-        time.sleep(0.2)    # stay under 100 req/min (probe phase)
+        time.sleep(0.2)
 
     return users
 
-
-# ── Profile photo fetcher ────────────────────────────────────────────────────
+# ── Profile photo fetcher ─────────────────────────────────────────────────────
 
 def get_profile_photo(user_id: str) -> str:
-    """
-    GET the profile photo URL for a user via users_photo endpoint.
-    Returns full URL or empty string.
-    """
     try:
         data = bd_get("/users_photo/get", params={
             "property":       "user_id",
@@ -192,7 +148,6 @@ def get_profile_photo(user_id: str) -> str:
         msg = data.get("message") or []
         if isinstance(msg, list) and msg:
             photo = msg[0]
-            # Try full URL fields first, then construct from filename
             full_url = (photo.get("file_main_full_url") or photo.get("file_full_url") or "").strip()
             if full_url:
                 return full_url
@@ -203,15 +158,9 @@ def get_profile_photo(user_id: str) -> str:
         pass
     return ""
 
-
 # ── Listing fetcher ───────────────────────────────────────────────────────────
 
 def get_user_listings(user_id: str) -> list:
-    """
-    GET portfolio groups for a user.
-    BD returns 400 (not empty array) when a user has no listings — treat as empty.
-    Uses next_page cursor for pagination if needed.
-    """
     all_listings = []
     page_cursor  = None
 
@@ -227,16 +176,15 @@ def get_user_listings(user_id: str) -> list:
             data = bd_get("/users_portfolio_groups/get", params=params)
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 400:
-                break   # BD returns 400 when user has no listings
+                break
             raise
-        msg  = data.get("message") or []
 
+        msg = data.get("message") or []
         if not isinstance(msg, list) or not msg:
             break
 
         all_listings.extend(msg)
 
-        # Paginate using next_page cursor (BD uses cursor tokens, not page numbers)
         next_page   = data.get("next_page")
         total_pages = int(data.get("total_pages") or 1)
         current     = int(data.get("current_page") or 1)
@@ -249,19 +197,16 @@ def get_user_listings(user_id: str) -> list:
 
     return all_listings
 
-
 # ── Text utilities ────────────────────────────────────────────────────────────
 
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text or "").strip()
-
 
 def truncate_utf8(text: str, max_bytes: int) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
     return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip()
-
 
 def enforce_byte_cap(record: dict) -> dict:
     for field in ("description", "bio", "snippet"):
@@ -272,12 +217,10 @@ def enforce_byte_cap(record: dict) -> dict:
             record[field] = truncate_utf8(val, len(val.encode("utf-8")) // 2)
     return record
 
-
 def resolve_tags(tags_str: str) -> list:
     if not tags_str:
         return []
     return [t.strip() for t in tags_str.split(",") if t.strip()]
-
 
 # ── Record builders ───────────────────────────────────────────────────────────
 
@@ -318,7 +261,6 @@ def build_educator_record(user: dict) -> dict:
             pass
 
     return record
-
 
 def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     gid         = str(listing.get("group_id") or "")
@@ -375,26 +317,22 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
 
     return record
 
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     client = SearchClient.create(ALGOLIA_APP_ID, ALGOLIA_WRITE_KEY)
     index  = client.init_index(ALGOLIA_INDEX_NAME)
 
-    # Step 1: Get total member count
     print("Getting total member count…")
     total_members = get_total_member_count()
-    print(f"  {total_members} total members on platform\n")
+    print(f"{total_members} total members\n")
 
-    # Step 2: Probe sequential user IDs to find all active members
-    print(f"Probing user IDs 1-{MAX_USER_ID} for active members…")
+    print(f"Probing user IDs 1-{MAX_USER_ID}…")
     users = get_all_active_users(total_members)
-    print(f"\n  {len(users)} active educators found\n")
+    print(f"{len(users)} active educators found\n")
 
-    listing_records  = []
+    listing_records = []
 
-    # Step 3: Build records + fetch listings for each user
     print("Pausing 30s to let rate limit reset…")
     time.sleep(1)
 
@@ -410,29 +348,24 @@ def main():
                 if str(l.get("group_status")) == LISTING_STATUS
                 and str(l.get("data_id")) == LISTING_DATA_ID
             ]
-            # Get educator profile photo from dedicated photo endpoint
             educator_photo = get_profile_photo(uid)
             for listing in published:
                 listing_records.append(enforce_byte_cap(build_listing_record(listing, educator_photo)))
             if published:
                 print(f"  {len(published)} published listings")
             else:
-                print(f"  no listings")
+                print("  no listings")
         except Exception as e:
             print(f"  listings error: {e}")
 
-        time.sleep(0.2)   # stay under 100 req/min (listing phase)
+        time.sleep(0.2)
 
     print(f"\n{len(listing_records)} listing records")
 
-    # Step 4: Replace entire index contents atomically
-    # This removes any records that no longer exist (unpublished, deleted listings)
     print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
     index.replace_all_objects(listing_records)
-    print("  Index replaced.")
-
+    print("Index replaced.")
     print("Sync complete.")
-
 
 if __name__ == "__main__":
     main()
