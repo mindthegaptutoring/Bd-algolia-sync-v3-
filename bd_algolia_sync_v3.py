@@ -12,6 +12,7 @@ import json
 import time
 import math
 import requests
+import random  # Add this at the top with your other imports
 from algoliasearch.search_client import SearchClient
 from requests.exceptions import HTTPError, RequestException
 
@@ -330,7 +331,6 @@ def build_educator_record(user: dict) -> dict:
 
     return record
 
-
 def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     gid         = str(listing.get("group_id") or "")
     title       = (listing.get("group_name") or "").strip()
@@ -368,36 +368,37 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
 
     record = {
         "objectID":         f"listing_{gid}",
-        "type":             "listing",
-        "group_id":         gid,
-        "user_id":          str(listing.get("user_id") or ""),
-        "title":            title,
-        "description":      description,
-        "snippet":          snippet,
-        "thumbnail":        thumbnail,
-        "tags":             tags,
-        "category":         (listing.get("group_category") or "").strip(),
-        "listing_url":      f"{BD_BASE}/{listing.get('group_filename', '').lstrip('/')}",
-        "post_link":        (listing.get("post_link") or "").strip(),
-        "post_location":    (listing.get("post_location") or "").strip(),
-        "class_rates":      (listing.get("class_rates") or "").strip(),
-        "grades":           grades,
-        "delivery_method":  delivery,
-        "format":           format_val,
-        "duration":         (listing.get("duration") or "").strip(),
-        "scheduling":       scheduling,
-        "prerequisites":    (listing.get("prerequisites") or "").strip(),
-        "cohort_size":      listing.get("cohort_size"),
-        "listing_category": (listing.get("listing_category") or "").strip(),
-        "last_updated":     listing.get("revision_timestamp", ""),
-        "city":             city,
-        "state":            state,
-        "country":          country,
-        "profile_photo":    educator_photo,
+        "type":              "listing",
+        "group_id":          gid,
+        "user_id":           str(listing.get("user_id") or ""),
+        "title":             title,
+        "description":       description,
+        "snippet":           snippet,
+        "thumbnail":         thumbnail,
+        "tags":              tags,
+        "category":          (listing.get("group_category") or "").strip(),
+        "listing_url":       f"{BD_BASE}/{listing.get('group_filename', '').lstrip('/')}",
+        "post_link":         (listing.get("post_link") or "").strip(),
+        "post_location":     (listing.get("post_location") or "").strip(),
+        "class_rates":       (listing.get("class_rates") or "").strip(),
+        "grades":            grades,
+        "delivery_method":   delivery,
+        "format":            format_val,
+        "duration":          (listing.get("duration") or "").strip(),
+        "scheduling":        scheduling,
+        "prerequisites":     (listing.get("prerequisites") or "").strip(),
+        "cohort_size":       listing.get("cohort_size"),
+        "listing_category":  (listing.get("listing_category") or "").strip(),
+        "last_updated":      listing.get("revision_timestamp", ""),
+        "city":              city,
+        "state":             state,
+        "country":           country,
+        "profile_photo":     educator_photo,
+        "random_rank":       random.randint(1, 1000000), # Added for static-random sorting
     }
 
     return enforce_byte_cap(record)
-
+    
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
