@@ -59,11 +59,11 @@ SNIPPET_CHARS    = 205
 
 FORMAT_MAP = {
     "1": "1-on-1 Teaching",
-    "2": "Coaching & Mentoring",
-    "3": "Online Group Classes",
-    "4": "Resources",
-    "5": "Self Paced Classes",
-    "6": "Tutoring",
+    "6": "Coaching & Mentoring",
+    "4": "Online Group Classes",
+    "5": "Resources",
+    "3": "Self Paced Classes",
+    "2": "Tutoring",
 }
 
 GRADE_MAP = {
