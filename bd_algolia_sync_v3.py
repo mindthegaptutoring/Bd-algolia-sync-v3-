@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-bd_algolia_sync.py  v4.0
-Syncs educators and listings to Algolia via BD API v2.
+Optimized BD → Algolia sync script
+- Retries on 429/5xx with exponential backoff
+- Minimizes sleeps while staying rate‑limit safe
+- Designed for Render cron (hourly or 2‑hourly)
 """
 
 import os
 import re
 import json
 import time
+import math
 import requests
 from algoliasearch.search_client import SearchClient
+from requests.exceptions import HTTPError, RequestException
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -28,13 +32,13 @@ BD_HEADERS = {
 LISTING_DATA_ID  = "6"   # Classes & Resources
 LISTING_STATUS   = "1"   # published
 ACTIVE_USER      = "2"   # active member
-MAX_USER_ID      = 300   # probe up to this ID; increase as platform grows
+MAX_USER_ID      = 300   # probe up to this ID; safe upper bound
 
 MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
 SNIPPET_CHARS    = 205
 
-# ── Field value mappings ─────────────────────────────────────────────────────
+# ── Field mappings ────────────────────────────────────────────────────────────
 
 FORMAT_MAP = {
     "1": "1-on-1 Teaching",
@@ -56,11 +60,11 @@ GRADE_MAP = {
 }
 
 SCHEDULING_MAP = {
-    "flexible_scheduling":        "Flexible scheduling",
-    "meets_at_a_set_weekly_time": "Meets at a set weekly time",
-    "meets_multiple_times_per_week": "Meets multiple times per week",
-    "onetime_session":            "One-time session",
-    "self_paced":                 "Self-paced (no live meetings)",
+    "flexible_scheduling":            "Flexible scheduling",
+    "meets_at_a_set_weekly_time":     "Meets at a set weekly time",
+    "meets_multiple_times_per_week":  "Meets multiple times per week",
+    "onetime_session":                "One-time session",
+    "self_paced":                     "Self-paced (no live meetings)",
 }
 
 DELIVERY_MAP = {
@@ -69,77 +73,115 @@ DELIVERY_MAP = {
     "synchronous_asynchronous": "Hybrid, mix of both",
 }
 
-# ── BD API helpers ────────────────────────────────────────────────────────────
+# ── HTTP helpers with retry/backoff ───────────────────────────────────────────
+
+SESSION = requests.Session()
+
+
+def bd_request(method: str, endpoint: str, *, params=None, body=None,
+               max_retries: int = 5, base_delay: float = 0.5) -> dict:
+    url = f"{BD_BASE_URL}{endpoint}"
+    params = params or {}
+    for attempt in range(max_retries):
+        try:
+            resp = SESSION.request(
+                method=method,
+                url=url,
+                headers=BD_HEADERS,
+                params=params,
+                json=body,
+                timeout=30,
+            )
+            if resp.status_code in (429, 500, 502, 503, 504):
+                # Rate limit / transient error: backoff and retry
+                delay = base_delay * (2 ** attempt)
+                print(f"  BD {resp.status_code} on {endpoint}, retrying in {delay:.1f}s…")
+                time.sleep(delay)
+                continue
+
+            resp.raise_for_status()
+            text = resp.text.strip()
+            return resp.json() if text else {}
+        except HTTPError as e:
+            # Non‑retryable HTTP error
+            print(f"  HTTP error on {endpoint}: {e}")
+            raise
+        except RequestException as e:
+            # Network error: backoff and retry
+            delay = base_delay * (2 ** attempt)
+            print(f"  Network error on {endpoint}: {e}, retrying in {delay:.1f}s…")
+            time.sleep(delay)
+            continue
+
+    raise RuntimeError(f"Failed BD request {method} {endpoint} after {max_retries} attempts")
+
 
 def bd_get(endpoint: str, params: dict = None) -> dict:
-    resp = requests.get(
-        f"{BD_BASE_URL}{endpoint}",
-        headers=BD_HEADERS,
-        params=params or {},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    if not resp.text.strip():
-        return {}
-    return resp.json()
+    return bd_request("GET", endpoint, params=params)
+
 
 def bd_post(endpoint: str, body: dict) -> dict:
-    resp = requests.post(
-        f"{BD_BASE_URL}{endpoint}",
-        headers=BD_HEADERS,
-        json=body,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    if not resp.text.strip():
-        return {}
-    return resp.json()
+    return bd_request("POST", endpoint, body=body)
 
 # ── User discovery ────────────────────────────────────────────────────────────
+
 
 def get_total_member_count() -> int:
     try:
         data = bd_post("/user/search", {"limit": 1})
-        return int(data.get("total_members") or 0)
-    except Exception:
+        total = int(data.get("total_members") or 0)
+        return max(total, 0)
+    except Exception as e:
+        print(f"  Could not get total member count, falling back to MAX_USER_ID: {e}")
         return MAX_USER_ID
+
 
 def get_all_active_users(total_members: int) -> list:
     users = []
     consecutive_misses = 0
 
     for uid in range(1, MAX_USER_ID + 1):
+        if len(users) >= total_members and total_members > 0:
+            break
+
         try:
             data = bd_get("/user/get", params={
                 "property":       "user_id",
                 "property_value": str(uid),
             })
-            msg  = data.get("message") or []
+            msg = data.get("message") or []
             user = msg[0] if isinstance(msg, list) and msg else None
 
             if user:
                 consecutive_misses = 0
                 name   = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
                 sub_id = str(user.get("subscription_id", ""))
-                if str(user.get("active", "")) == ACTIVE_USER and name and sub_id not in ("4", "7"):
+                is_active = str(user.get("active", "")) == ACTIVE_USER
+                if is_active and name and sub_id not in ("4", "7"):
                     users.append(user)
-                    if len(users) >= total_members:
-                        break
             else:
                 consecutive_misses += 1
                 if len(users) > 0 and consecutive_misses >= 50:
                     break
 
-        except Exception:
+        except Exception as e:
+            print(f"  user_id={uid} error: {e}")
             consecutive_misses += 1
 
-        time.sleep(0.2)
+        # Small, steady pacing to avoid hammering BD
+        time.sleep(0.1)
 
     return users
 
-# ── Profile photo fetcher ─────────────────────────────────────────────────────
+# ── Profile photo fetcher with simple cache ───────────────────────────────────
+
+PHOTO_CACHE: dict[str, str] = {}
+
 
 def get_profile_photo(user_id: str) -> str:
+    if user_id in PHOTO_CACHE:
+        return PHOTO_CACHE[user_id]
+
     try:
         data = bd_get("/users_photo/get", params={
             "property":       "user_id",
@@ -148,21 +190,29 @@ def get_profile_photo(user_id: str) -> str:
         msg = data.get("message") or []
         if isinstance(msg, list) and msg:
             photo = msg[0]
-            full_url = (photo.get("file_main_full_url") or photo.get("file_full_url") or "").strip()
+            full_url = (photo.get("file_main_full_url")
+                        or photo.get("file_full_url")
+                        or "").strip()
             if full_url:
+                PHOTO_CACHE[user_id] = full_url
                 return full_url
             filename = (photo.get("file") or photo.get("filename") or "").strip()
             if filename:
-                return f"{BD_BASE}/pictures/profile/{filename}"
-    except Exception:
-        pass
+                url = f"{BD_BASE}/pictures/profile/{filename}"
+                PHOTO_CACHE[user_id] = url
+                return url
+    except Exception as e:
+        print(f"  photo error for user_id={user_id}: {e}")
+
+    PHOTO_CACHE[user_id] = ""
     return ""
 
-# ── Listing fetcher ───────────────────────────────────────────────────────────
+# ── Listing fetcher with retry at call level ──────────────────────────────────
+
 
 def get_user_listings(user_id: str) -> list:
     all_listings = []
-    page_cursor  = None
+    page_cursor = None
 
     while True:
         params = {
@@ -174,7 +224,8 @@ def get_user_listings(user_id: str) -> list:
 
         try:
             data = bd_get("/users_portfolio_groups/get", params=params)
-        except requests.exceptions.HTTPError as e:
+        except HTTPError as e:
+            # 400 means no portfolio for this user; treat as no listings
             if e.response is not None and e.response.status_code == 400:
                 break
             raise
@@ -191,7 +242,7 @@ def get_user_listings(user_id: str) -> list:
 
         if next_page and current < total_pages:
             page_cursor = next_page
-            time.sleep(0.2)
+            time.sleep(0.1)
         else:
             break
 
@@ -199,8 +250,10 @@ def get_user_listings(user_id: str) -> list:
 
 # ── Text utilities ────────────────────────────────────────────────────────────
 
+
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text or "").strip()
+
 
 def truncate_utf8(text: str, max_bytes: int) -> str:
     encoded = text.encode("utf-8")
@@ -208,14 +261,28 @@ def truncate_utf8(text: str, max_bytes: int) -> str:
         return text
     return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip()
 
+
 def enforce_byte_cap(record: dict) -> dict:
-    for field in ("description", "bio", "snippet"):
-        while len(json.dumps(record).encode("utf-8")) > MAX_RECORD_BYTES:
+    # Iteratively shrink large text fields until record fits under MAX_RECORD_BYTES
+    fields = ["description", "bio", "snippet"]
+    while len(json.dumps(record).encode("utf-8")) > MAX_RECORD_BYTES:
+        shrunk_any = False
+        for field in fields:
             val = record.get(field, "")
             if not val:
+                continue
+            current_bytes = len(val.encode("utf-8"))
+            if current_bytes <= 100:
+                continue
+            new_bytes = max(100, math.floor(current_bytes * 0.7))
+            record[field] = truncate_utf8(val, new_bytes)
+            shrunk_any = True
+            if len(json.dumps(record).encode("utf-8")) <= MAX_RECORD_BYTES:
                 break
-            record[field] = truncate_utf8(val, len(val.encode("utf-8")) // 2)
+        if not shrunk_any:
+            break
     return record
+
 
 def resolve_tags(tags_str: str) -> list:
     if not tags_str:
@@ -223,6 +290,7 @@ def resolve_tags(tags_str: str) -> list:
     return [t.strip() for t in tags_str.split(",") if t.strip()]
 
 # ── Record builders ───────────────────────────────────────────────────────────
+
 
 def build_educator_record(user: dict) -> dict:
     uid = str(user.get("user_id", ""))
@@ -262,6 +330,7 @@ def build_educator_record(user: dict) -> dict:
 
     return record
 
+
 def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     gid         = str(listing.get("group_id") or "")
     title       = (listing.get("group_name") or "").strip()
@@ -285,6 +354,18 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         state   = (nested_user.get("state_ln") or "").strip()
         country = (nested_user.get("country_ln") or "").strip()
 
+    delivery_raw = (listing.get("delivery_method") or "").strip().rstrip("_")
+    delivery     = DELIVERY_MAP.get(delivery_raw, delivery_raw)
+
+    format_raw = (listing.get("format") or "").strip()
+    format_val = FORMAT_MAP.get(format_raw, format_raw)
+
+    grades_raw = resolve_tags(listing.get("grades", ""))
+    grades     = [GRADE_MAP.get(g, g) for g in grades_raw]
+
+    scheduling_raw = resolve_tags(listing.get("scheduling", ""))
+    scheduling     = [SCHEDULING_MAP.get(s, s) for s in scheduling_raw]
+
     record = {
         "objectID":         f"listing_{gid}",
         "type":             "listing",
@@ -300,11 +381,11 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "post_link":        (listing.get("post_link") or "").strip(),
         "post_location":    (listing.get("post_location") or "").strip(),
         "class_rates":      (listing.get("class_rates") or "").strip(),
-        "grades":           [GRADE_MAP.get(g, g) for g in resolve_tags(listing.get("grades", ""))],
-        "delivery_method":  DELIVERY_MAP.get((listing.get("delivery_method") or "").strip().rstrip("_"), (listing.get("delivery_method") or "").strip().rstrip("_")),
-        "format":           FORMAT_MAP.get((listing.get("format") or "").strip(), (listing.get("format") or "").strip()),
+        "grades":           grades,
+        "delivery_method":  delivery,
+        "format":           format_val,
         "duration":         (listing.get("duration") or "").strip(),
-        "scheduling":       [SCHEDULING_MAP.get(s, s) for s in resolve_tags(listing.get("scheduling", ""))],
+        "scheduling":       scheduling,
         "prerequisites":    (listing.get("prerequisites") or "").strip(),
         "cohort_size":      listing.get("cohort_size"),
         "listing_category": (listing.get("listing_category") or "").strip(),
@@ -315,9 +396,10 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "profile_photo":    educator_photo,
     }
 
-    return record
+    return enforce_byte_cap(record)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 
 def main():
     client = SearchClient.create(ALGOLIA_APP_ID, ALGOLIA_WRITE_KEY)
@@ -325,16 +407,13 @@ def main():
 
     print("Getting total member count…")
     total_members = get_total_member_count()
-    print(f"{total_members} total members\n")
+    print(f"{total_members} total members (approx)\n")
 
-    print(f"Probing user IDs 1-{MAX_USER_ID}…")
+    print(f"Probing user IDs 1–{MAX_USER_ID}…")
     users = get_all_active_users(total_members)
     print(f"{len(users)} active educators found\n")
 
     listing_records = []
-
-    print("Pausing 30s to let rate limit reset…")
-    time.sleep(5)
 
     for i, user in enumerate(users, 1):
         uid  = str(user.get("user_id", ""))
@@ -348,24 +427,25 @@ def main():
                 if str(l.get("group_status")) == LISTING_STATUS
                 and str(l.get("data_id")) == LISTING_DATA_ID
             ]
-            educator_photo = get_profile_photo(uid)
-            for listing in published:
-                listing_records.append(enforce_byte_cap(build_listing_record(listing, educator_photo)))
-            if published:
-                print(f"  {len(published)} published listings")
-            else:
+            if not published:
                 print("  no listings")
+            else:
+                educator_photo = get_profile_photo(uid)
+                for listing in published:
+                    listing_records.append(build_listing_record(listing, educator_photo))
+                print(f"  {len(published)} published listings")
         except Exception as e:
-            print(f"  listings error: {e}")
+            print(f"  listings error for user_id={uid}: {e}")
 
-        time.sleep(0.2)
+        # Small pacing between users
+        time.sleep(0.1)
 
-    print(f"\n{len(listing_records)} listing records")
+    print(f"\n{len(listing_records)} listing records to push")
 
     print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
     index.replace_all_objects(listing_records)
-    print("Index replaced.")
-    print("Sync complete.")
+    print("Index replaced. Sync complete.")
+
 
 if __name__ == "__main__":
     main()
