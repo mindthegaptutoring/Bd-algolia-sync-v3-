@@ -12,7 +12,7 @@ import json
 import time
 import math
 import requests
-import random  # Add this at the top with your other imports
+import random
 from algoliasearch.search_client import SearchClient
 from requests.exceptions import HTTPError, RequestException
 
@@ -78,7 +78,6 @@ DELIVERY_MAP = {
 
 SESSION = requests.Session()
 
-
 def bd_request(method: str, endpoint: str, *, params=None, body=None,
                max_retries: int = 5, base_delay: float = 0.5) -> dict:
     url = f"{BD_BASE_URL}{endpoint}"
@@ -94,25 +93,26 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
                 timeout=30,
             )
             
-            # ... in your bd_request function ...
             if resp.status_code in (429, 500, 502, 503, 504):
-                # Add "Jitter": random float between 0.5 and 1.5 to multiply the delay
+                # Add "Jitter" to the delay to prevent thundering herd
                 jitter = random.uniform(0.5, 1.5)
                 delay = (base_delay * (2 ** attempt)) * jitter
-                print(f"  BD {resp.status_code}, retrying in {delay:.1f}s (with jitter)…")
+                print(f"  BD {resp.status_code}, retrying in {delay:.1f}s…")
                 time.sleep(delay)
                 continue
 
             resp.raise_for_status()
             text = resp.text.strip()
             return resp.json() if text else {}
+
         except HTTPError as e:
-            # Only print the error if it IS NOT a 400 error on the portfolio endpoint
-            if not (e.response.status_code == 400 and "users_portfolio_groups" in endpoint):
+            # Handle the 400 "No listings" case silently
+            if e.response.status_code == 400 and "users_portfolio_groups" in endpoint:
+                raise # Re-raise so the calling function can catch the 400
+            
             print(f"  HTTP error on {endpoint}: {e}")
-        raise
+            raise
         except RequestException as e:
-            # Network error: backoff and retry
             delay = base_delay * (2 ** attempt)
             print(f"  Network error on {endpoint}: {e}, retrying in {delay:.1f}s…")
             time.sleep(delay)
@@ -120,16 +120,13 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
 
     raise RuntimeError(f"Failed BD request {method} {endpoint} after {max_retries} attempts")
 
-
 def bd_get(endpoint: str, params: dict = None) -> dict:
     return bd_request("GET", endpoint, params=params)
-
 
 def bd_post(endpoint: str, body: dict) -> dict:
     return bd_request("POST", endpoint, body=body)
 
 # ── User discovery ────────────────────────────────────────────────────────────
-
 
 def get_total_member_count() -> int:
     try:
@@ -139,7 +136,6 @@ def get_total_member_count() -> int:
     except Exception as e:
         print(f"  Could not get total member count, falling back to MAX_USER_ID: {e}")
         return MAX_USER_ID
-
 
 def get_all_active_users(total_members: int) -> list:
     users = []
@@ -173,15 +169,13 @@ def get_all_active_users(total_members: int) -> list:
             print(f"  user_id={uid} error: {e}")
             consecutive_misses += 1
 
-        # Small, steady pacing to avoid hammering BD
-        time.sleep(0.3)
+        time.sleep(0.3) # Slower pacing to prevent 429s
 
     return users
 
 # ── Profile photo fetcher with simple cache ───────────────────────────────────
 
 PHOTO_CACHE: dict[str, str] = {}
-
 
 def get_profile_photo(user_id: str) -> str:
     if user_id in PHOTO_CACHE:
@@ -213,7 +207,6 @@ def get_profile_photo(user_id: str) -> str:
     return ""
 
 # ── Listing fetcher with retry at call level ──────────────────────────────────
-
 
 def get_user_listings(user_id: str) -> list:
     all_listings = []
@@ -255,10 +248,8 @@ def get_user_listings(user_id: str) -> list:
 
 # ── Text utilities ────────────────────────────────────────────────────────────
 
-
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text or "").strip()
-
 
 def truncate_utf8(text: str, max_bytes: int) -> str:
     encoded = text.encode("utf-8")
@@ -266,9 +257,7 @@ def truncate_utf8(text: str, max_bytes: int) -> str:
         return text
     return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip()
 
-
 def enforce_byte_cap(record: dict) -> dict:
-    # Iteratively shrink large text fields until record fits under MAX_RECORD_BYTES
     fields = ["description", "bio", "snippet"]
     while len(json.dumps(record).encode("utf-8")) > MAX_RECORD_BYTES:
         shrunk_any = False
@@ -288,14 +277,12 @@ def enforce_byte_cap(record: dict) -> dict:
             break
     return record
 
-
 def resolve_tags(tags_str: str) -> list:
     if not tags_str:
         return []
     return [t.strip() for t in tags_str.split(",") if t.strip()]
 
 # ── Record builders ───────────────────────────────────────────────────────────
-
 
 def build_educator_record(user: dict) -> dict:
     uid = str(user.get("user_id", ""))
@@ -323,6 +310,7 @@ def build_educator_record(user: dict) -> dict:
         "listing_type":       (user.get("listing_type") or "").strip(),
         "active":             user.get("active"),
         "signup_date":        user.get("signup_date", ""),
+        "random_rank":        random.randint(1, 1000000), # Added randomization
     }
 
     lat = user.get("lat")
@@ -398,7 +386,7 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "state":             state,
         "country":           country,
         "profile_photo":     educator_photo,
-        "random_rank":       random.randint(1, 1000000), # Added for static-random sorting
+        "random_rank":       random.randint(1, 1000000), # Randomization for sorting
     }
 
     return enforce_byte_cap(record)
