@@ -107,9 +107,10 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
             text = resp.text.strip()
             return resp.json() if text else {}
         except HTTPError as e:
-            # Non‑retryable HTTP error
+            # Only print the error if it IS NOT a 400 error on the portfolio endpoint
+            if not (e.response.status_code == 400 and "users_portfolio_groups" in endpoint):
             print(f"  HTTP error on {endpoint}: {e}")
-            raise
+        raise
         except RequestException as e:
             # Network error: backoff and retry
             delay = base_delay * (2 ** attempt)
@@ -173,7 +174,7 @@ def get_all_active_users(total_members: int) -> list:
             consecutive_misses += 1
 
         # Small, steady pacing to avoid hammering BD
-        time.sleep(0.1)
+        time.sleep(0.3)
 
     return users
 
@@ -246,7 +247,7 @@ def get_user_listings(user_id: str) -> list:
 
         if next_page and current < total_pages:
             page_cursor = next_page
-            time.sleep(0.1)
+            time.sleep(0.3)
         else:
             break
 
@@ -442,7 +443,7 @@ def main():
             print(f"  listings error for user_id={uid}: {e}")
 
         # Small pacing between users
-        time.sleep(0.1)
+        time.sleep(0.3)
 
     print(f"\n{len(listing_records)} listing records to push")
 
