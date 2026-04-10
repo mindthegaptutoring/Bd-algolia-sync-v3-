@@ -93,10 +93,13 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
                 json=body,
                 timeout=30,
             )
+            
+            # ... in your bd_request function ...
             if resp.status_code in (429, 500, 502, 503, 504):
-                # Rate limit / transient error: backoff and retry
-                delay = base_delay * (2 ** attempt)
-                print(f"  BD {resp.status_code} on {endpoint}, retrying in {delay:.1f}s…")
+                # Add "Jitter": random float between 0.5 and 1.5 to multiply the delay
+                jitter = random.uniform(0.5, 1.5)
+                delay = (base_delay * (2 ** attempt)) * jitter
+                print(f"  BD {resp.status_code}, retrying in {delay:.1f}s (with jitter)…")
                 time.sleep(delay)
                 continue
 
