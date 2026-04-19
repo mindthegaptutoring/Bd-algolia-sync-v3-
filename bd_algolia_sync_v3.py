@@ -65,13 +65,13 @@ SCHEDULING_MAP = {
     "meets_at_a_set_weekly_time":     "Meets at a set weekly time",
     "meets_multiple_times_per_week":  "Meets multiple times per week",
     "onetime_session":                "One-time session",
-    "self_paced":                     "Self-paced (no live meetings)",
+    "selfpaced_no_live_meetings":                     "Self-paced (no live meetings)",
 }
 
 DELIVERY_MAP = {
     "synchronous":              "Live, scheduled sessions",
     "asynchronous":             "Self-paced, learn anytime",
-    "synchronous_asynchronous": "Hybrid, mix of both",
+    "hybrid": "Hybrid, mix of both",
 }
 
 # ── HTTP helpers with retry/backoff ───────────────────────────────────────────
