@@ -18,7 +18,7 @@ from requests.exceptions import HTTPError, RequestException
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-BD_BASE            = "https://learnwitheveryavenue.com"
+BD_BASE            = "https://www.learnwitheveryavenue.com"
 BD_BASE_URL        = f"{BD_BASE}/api/v2"
 BD_API_KEY         = os.environ["BD_API_KEY"]
 ALGOLIA_APP_ID     = os.environ["ALGOLIA_APP_ID"]
