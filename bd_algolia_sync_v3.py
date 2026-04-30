@@ -157,29 +157,18 @@ def get_all_active_users(total_members: int) -> list:
                 is_active = str(user.get("active", "")) == ACTIVE_USER
                 if is_active and name and sub_id not in ("4", "7"):
                     users.append(user)
+                time.sleep(0.15)
             else:
                 consecutive_misses += 1
-                if len(users) > 0 and consecutive_misses >= 50:
+                if len(users) > 0 and consecutive_misses >= 20:
+                    print(f"  20 consecutive misses after user_id={uid - 1}, stopping probe.")
                     break
 
         except Exception as e:
             print(f"  user_id={uid} error: {e}")
             consecutive_misses += 1
 
-        time.sleep(0.3)
-
     return users
-
-# ── Profile photo URL construction ────────────────────────────────────────────
-
-def build_profile_photo_url(user_id: str) -> str:
-    """
-    BD stores profile photos at a predictable path:
-      /pictures/profile/pimage-{user_id}-0-photo.png
-    No API call needed. Educators without a photo will 404 —
-    handle that gracefully on the frontend with a fallback avatar.
-    """
-    return f"{BD_BASE}/pictures/profile/pimage-{user_id}-0-photo.png"
 
 # ── Listing fetcher ───────────────────────────────────────────────────────────
 
@@ -214,7 +203,7 @@ def get_user_listings(user_id: str) -> list:
 
         if next_page and current < total_pages:
             page_cursor = next_page
-            time.sleep(0.3)
+            time.sleep(0.15)
         else:
             break
 
@@ -261,7 +250,7 @@ def resolve_tags(tags_str: str) -> list:
 def build_educator_record(user: dict) -> dict:
     uid = str(user.get("user_id", ""))
     bio = strip_html(user.get("about_me") or "")[:BIO_CHAR_LIMIT]
-    profile_photo = build_profile_photo_url(uid)
+    profile_photo = (user.get("image_main_file") or "").strip()
 
     record = {
         "objectID":           f"educator_{uid}",
@@ -393,14 +382,15 @@ def main():
             if not published:
                 print("  no listings")
             else:
-                educator_photo = build_profile_photo_url(uid)
+                educator_photo = (user.get("image_main_file") or "").strip()
+                print(f"  profile_photo: {repr(educator_photo)}")
                 for listing in published:
                     listing_records.append(build_listing_record(listing, educator_photo))
                 print(f"  {len(published)} published listings")
         except Exception as e:
             print(f"  listings error for user_id={uid}: {e}")
 
-        time.sleep(0.3)
+        time.sleep(0.15)
 
     print(f"\n{len(listing_records)} listing records to push")
     print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
