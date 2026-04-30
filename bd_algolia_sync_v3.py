@@ -15,7 +15,6 @@ import requests
 import random
 from algoliasearch.search_client import SearchClient
 from requests.exceptions import HTTPError, RequestException
-from bs4 import BeautifulSoup
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -29,12 +28,6 @@ ALGOLIA_INDEX_NAME = os.environ.get("ALGOLIA_INDEX_NAME", "educators")
 BD_HEADERS = {
     "X-Api-Key":    BD_API_KEY,
     "Content-Type": "application/json",
-}
-
-SCRAPE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
 }
 
 LISTING_DATA_ID  = "6"   # Classes & Resources
@@ -177,48 +170,16 @@ def get_all_active_users(total_members: int) -> list:
 
     return users
 
-# ── Profile photo — scrape educator profile page ──────────────────────────────
+# ── Profile photo URL construction ────────────────────────────────────────────
 
-PHOTO_CACHE: dict[str, str] = {}
-
-def get_profile_photo_from_page(profile_url: str) -> str:
+def build_profile_photo_url(user_id: str) -> str:
     """
-    Scrape the educator's BD profile page and extract their profile photo.
-    Uses the same selector that worked in the original HTML scraper:
-      .author-snapshot-details img.search_result_image
-    One request per educator (cached), not per listing.
+    BD stores profile photos at a predictable path:
+      /pictures/profile/pimage-{user_id}-0-photo.png
+    No API call needed. Educators without a photo will 404 —
+    handle that gracefully on the frontend with a fallback avatar.
     """
-    if profile_url in PHOTO_CACHE:
-        return PHOTO_CACHE[profile_url]
-
-    try:
-        resp = SESSION.get(profile_url, headers=SCRAPE_HEADERS, timeout=15)
-        if resp.status_code != 200:
-            print(f"  photo page {resp.status_code} for {profile_url}")
-            PHOTO_CACHE[profile_url] = ""
-            return ""
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        photo_el = soup.select_one(".author-snapshot-details img.search_result_image")
-        if photo_el and photo_el.get("src"):
-            src = photo_el["src"]
-            url = src if src.startswith("http") else f"{BD_BASE}{src}"
-            PHOTO_CACHE[profile_url] = url
-            return url
-
-        # Fallback: look for any profile image in the header area
-        fallback_el = soup.select_one(".profile-header img, .member-photo img")
-        if fallback_el and fallback_el.get("src"):
-            src = fallback_el["src"]
-            url = src if src.startswith("http") else f"{BD_BASE}{src}"
-            PHOTO_CACHE[profile_url] = url
-            return url
-
-    except Exception as e:
-        print(f"  photo scrape error for {profile_url}: {e}")
-
-    PHOTO_CACHE[profile_url] = ""
-    return ""
+    return f"{BD_BASE}/pictures/profile/pimage-{user_id}-0-photo.png"
 
 # ── Listing fetcher ───────────────────────────────────────────────────────────
 
@@ -300,8 +261,7 @@ def resolve_tags(tags_str: str) -> list:
 def build_educator_record(user: dict) -> dict:
     uid = str(user.get("user_id", ""))
     bio = strip_html(user.get("about_me") or "")[:BIO_CHAR_LIMIT]
-    profile_url = f"{BD_BASE}/{user.get('filename', '').lstrip('/')}"
-    profile_photo = get_profile_photo_from_page(profile_url)
+    profile_photo = build_profile_photo_url(uid)
 
     record = {
         "objectID":           f"educator_{uid}",
@@ -316,7 +276,7 @@ def build_educator_record(user: dict) -> dict:
         "country":            (user.get("country_ln") or "").strip(),
         "website":            (user.get("website") or "").strip(),
         "instagram":          (user.get("instagram") or "").strip(),
-        "profile_url":        profile_url,
+        "profile_url":        f"{BD_BASE}/{user.get('filename', '').lstrip('/')}",
         "profile_photo":      profile_photo,
         "listing_type":       (user.get("listing_type") or "").strip(),
         "active":             user.get("active"),
@@ -421,7 +381,6 @@ def main():
     for i, user in enumerate(users, 1):
         uid  = str(user.get("user_id", ""))
         name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
-        profile_url = f"{BD_BASE}/{user.get('filename', '').lstrip('/')}"
         print(f"[{i}/{len(users)}] {name} (user_id={uid})")
 
         try:
@@ -434,8 +393,7 @@ def main():
             if not published:
                 print("  no listings")
             else:
-                educator_photo = get_profile_photo_from_page(profile_url)
-                print(f"  profile_photo: {repr(educator_photo)}")
+                educator_photo = build_profile_photo_url(uid)
                 for listing in published:
                     listing_records.append(build_listing_record(listing, educator_photo))
                 print(f"  {len(published)} published listings")
