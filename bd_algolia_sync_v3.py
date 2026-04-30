@@ -65,13 +65,13 @@ SCHEDULING_MAP = {
     "meets_at_a_set_weekly_time":     "Meets at a set weekly time",
     "meets_multiple_times_per_week":  "Meets multiple times per week",
     "onetime_session":                "One-time session",
-    "selfpaced_no_live_meetings":                     "Self-paced (no live meetings)",
+    "selfpaced_no_live_meetings":     "Self-paced (no live meetings)",
 }
 
 DELIVERY_MAP = {
-    "synchronous":              "Live, scheduled sessions",
-    "asynchronous":             "Self-paced, learn anytime",
-    "hybrid": "Hybrid, mix of both",
+    "synchronous":  "Live, scheduled sessions",
+    "asynchronous": "Self-paced, learn anytime",
+    "hybrid":       "Hybrid, mix of both",
 }
 
 # ── HTTP helpers with retry/backoff ───────────────────────────────────────────
@@ -92,9 +92,8 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
                 json=body,
                 timeout=30,
             )
-            
+
             if resp.status_code in (429, 500, 502, 503, 504):
-                # Add "Jitter" to the delay to prevent thundering herd
                 jitter = random.uniform(0.5, 1.5)
                 delay = (base_delay * (2 ** attempt)) * jitter
                 print(f"  BD {resp.status_code}, retrying in {delay:.1f}s…")
@@ -106,10 +105,8 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
             return resp.json() if text else {}
 
         except HTTPError as e:
-            # Handle the 400 "No listings" case silently
             if e.response.status_code == 400 and "users_portfolio_groups" in endpoint:
-                raise # Re-raise so the calling function can catch the 400
-            
+                raise
             print(f"  HTTP error on {endpoint}: {e}")
             raise
         except RequestException as e:
@@ -169,7 +166,7 @@ def get_all_active_users(total_members: int) -> list:
             print(f"  user_id={uid} error: {e}")
             consecutive_misses += 1
 
-        time.sleep(0.3) # Slower pacing to prevent 429s
+        time.sleep(0.3)
 
     return users
 
@@ -186,6 +183,7 @@ def get_profile_photo(user_id: str) -> str:
             "property":       "user_id",
             "property_value": user_id,
         })
+        print(f"  DEBUG photo raw response for {user_id}: {json.dumps(data)[:500]}")
         msg = data.get("message") or []
         if isinstance(msg, list) and msg:
             photo = msg[0]
@@ -223,7 +221,6 @@ def get_user_listings(user_id: str) -> list:
         try:
             data = bd_get("/users_portfolio_groups/get", params=params)
         except HTTPError as e:
-            # 400 means no portfolio for this user; treat as no listings
             if e.response is not None and e.response.status_code == 400:
                 break
             raise
@@ -310,7 +307,7 @@ def build_educator_record(user: dict) -> dict:
         "listing_type":       (user.get("listing_type") or "").strip(),
         "active":             user.get("active"),
         "signup_date":        user.get("signup_date", ""),
-        "random_rank":        random.randint(1, 1000000), # Added randomization
+        "random_rank":        random.randint(1, 1000000),
     }
 
     lat = user.get("lat")
@@ -386,13 +383,12 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "state":             state,
         "country":           country,
         "profile_photo":     educator_photo,
-        "random_rank":       random.randint(1, 1000000), # Randomization for sorting
+        "random_rank":       random.randint(1, 1000000),
     }
 
     return enforce_byte_cap(record)
-    
-# ── Main ──────────────────────────────────────────────────────────────────────
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     client = SearchClient.create(ALGOLIA_APP_ID, ALGOLIA_WRITE_KEY)
@@ -430,7 +426,6 @@ def main():
         except Exception as e:
             print(f"  listings error for user_id={uid}: {e}")
 
-        # Small pacing between users
         time.sleep(0.3)
 
     print(f"\n{len(listing_records)} listing records to push")
