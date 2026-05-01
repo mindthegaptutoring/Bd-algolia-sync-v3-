@@ -390,7 +390,7 @@ def main():
         except Exception as e:
             print(f"  listings error for user_id={uid}: {e}")
 
-        time.sleep(1.0)
+        time.sleep(2.0)
 
     print(f"\n{len(listing_records)} listing records to push")
     print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
