@@ -203,7 +203,7 @@ def get_user_listings(user_id: str) -> list:
 
         if next_page and current < total_pages:
             page_cursor = next_page
-            time.sleep(0.15)
+            time.sleep(0.3)
         else:
             break
 
@@ -390,7 +390,7 @@ def main():
         except Exception as e:
             print(f"  listings error for user_id={uid}: {e}")
 
-        time.sleep(0.15)
+        time.sleep(1.0)
 
     print(f"\n{len(listing_records)} listing records to push")
     print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
