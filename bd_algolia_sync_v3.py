@@ -50,6 +50,12 @@ FORMAT_MAP = {
     "6": "Coaching & Mentoring",
 }
 
+COHORT_SIZE_MAP = {
+    "2_to_5_students": "2–5 students",
+    "6_to_10_students": "6–10 students",
+    "11_students": "11+ students",
+}
+
 GRADE_MAP = {
     "prek":            "Pre-K",
     "k2":              "K-2",
@@ -318,6 +324,9 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     scheduling_raw = resolve_tags(listing.get("scheduling", ""))
     scheduling     = [SCHEDULING_MAP.get(s, s) for s in scheduling_raw]
 
+    cohort_raw  = (listing.get("cohort_size") or "").strip()
+    cohort_size = COHORT_SIZE_MAP.get(cohort_raw, cohort_raw)
+
     record = {
         "objectID":         f"listing_{gid}",
         "type":              "listing",
@@ -339,7 +348,7 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "duration":          (listing.get("duration") or "").strip(),
         "scheduling":        scheduling,
         "prerequisites":     (listing.get("prerequisites") or "").strip(),
-        "cohort_size":       listing.get("cohort_size"),
+        "cohort_size":       cohort_size,
         "listing_category":  (listing.get("listing_category") or "").strip(),
         "last_updated":      listing.get("revision_timestamp", ""),
         "city":              city,
