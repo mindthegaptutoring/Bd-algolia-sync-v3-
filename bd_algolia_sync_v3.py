@@ -324,8 +324,8 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     scheduling_raw = resolve_tags(listing.get("scheduling", ""))
     scheduling     = [SCHEDULING_MAP.get(s, s) for s in scheduling_raw]
 
-    cohort_raw  = (listing.get("cohort_size") or "").strip()
-    cohort_size = COHORT_SIZE_MAP.get(cohort_raw, cohort_raw)
+    cohort_raw  = resolve_tags(listing.get("cohort_size", ""))
+    cohort_size = [COHORT_SIZE_MAP.get(c, c) for c in cohort_raw]
 
     record = {
         "objectID":         f"listing_{gid}",
