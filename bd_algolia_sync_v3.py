@@ -59,7 +59,7 @@ COHORT_SIZE_MAP = {
 GRADE_MAP = {
     "prek":            "Pre-K",
     "k2":              "K-2",
-    "gr_36":           "Gr 3-6",
+    "gr_36":           "Gr 3-5",
     "gr_68":           "Gr 6-8",
     "gr_912":          "Gr 9-12",
     "postsecondary":   "Post-Secondary",
