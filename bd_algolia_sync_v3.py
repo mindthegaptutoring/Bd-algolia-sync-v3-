@@ -2,8 +2,8 @@
 """
 Optimized BD → Algolia sync script
 - Retries on 429/5xx with exponential backoff
-- Minimizes sleeps while staying rate‑limit safe
-- Designed for Render cron (hourly or 2‑hourly)
+- Minimizes sleeps while staying rate-limit safe
+- Designed for Render cron (hourly or 2-hourly)
 """
 
 import os
@@ -129,6 +129,22 @@ def bd_get(endpoint: str, params: dict = None) -> dict:
 def bd_post(endpoint: str, body: dict) -> dict:
     return bd_request("POST", endpoint, body=body)
 
+# ── Image URL helper ──────────────────────────────────────────────────────────
+
+def resolve_image_url(raw: str) -> str:
+    """
+    Always return a full absolute URL for profile photos.
+    BD sometimes returns a relative path like 'pictures/profile/pimage-xx.png'.
+    Storing a relative path causes the GitHub Pages widget to double-prefix it.
+    If it already starts with http, return as-is.
+    """
+    if not raw:
+        return ""
+    raw = raw.strip()
+    if raw.startswith("http"):
+        return raw
+    return f"{BD_BASE}/{raw.lstrip('/')}"
+
 # ── User discovery ────────────────────────────────────────────────────────────
 
 def get_total_member_count() -> int:
@@ -163,7 +179,8 @@ def get_all_active_users(total_members: int) -> list:
                 is_active = str(user.get("active", "")) == ACTIVE_USER
                 if is_active and name and sub_id not in ("4", "7"):
                     users.append(user)
-                time.sleep(0.15)
+                # FIX: increased from 0.15s to 0.5s to reduce 429s during probe
+                time.sleep(0.5)
             else:
                 consecutive_misses += 1
                 if len(users) > 0 and consecutive_misses >= 20:
@@ -173,6 +190,8 @@ def get_all_active_users(total_members: int) -> list:
         except Exception as e:
             print(f"  user_id={uid} error: {e}")
             consecutive_misses += 1
+            # FIX: extra pause after any error during probe to let BD recover
+            time.sleep(1.0)
 
     return users
 
@@ -256,7 +275,8 @@ def resolve_tags(tags_str: str) -> list:
 def build_educator_record(user: dict) -> dict:
     uid = str(user.get("user_id", ""))
     bio = strip_html(user.get("about_me") or "")[:BIO_CHAR_LIMIT]
-    profile_photo = (user.get("image_main_file") or "").strip()
+    # FIX: resolve to absolute URL to prevent doubled path in GitHub Pages widget
+    profile_photo = resolve_image_url(user.get("image_main_file") or "")
 
     record = {
         "objectID":           f"educator_{uid}",
@@ -354,6 +374,7 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "city":              city,
         "state":             state,
         "country":           country,
+        # FIX: educator_photo is now always a full absolute URL (resolved upstream)
         "profile_photo":     educator_photo,
         "random_rank":       random.randint(1, 1000000),
     }
@@ -391,7 +412,8 @@ def main():
             if not published:
                 print("  no listings")
             else:
-                educator_photo = (user.get("image_main_file") or "").strip()
+                # FIX: resolve photo to absolute URL here, passed down to build_listing_record
+                educator_photo = resolve_image_url(user.get("image_main_file") or "")
                 print(f"  profile_photo: {repr(educator_photo)}")
                 for listing in published:
                     listing_records.append(build_listing_record(listing, educator_photo))
@@ -399,7 +421,8 @@ def main():
         except Exception as e:
             print(f"  listings error for user_id={uid}: {e}")
 
-        time.sleep(2.0)
+        # FIX: increased from 2.0s to 3.0s to reduce 429s during listing fetch loop
+        time.sleep(3.0)
 
     print(f"\n{len(listing_records)} listing records to push")
     print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
