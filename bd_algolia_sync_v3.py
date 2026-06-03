@@ -33,7 +33,7 @@ BD_HEADERS = {
 LISTING_DATA_ID  = "6"   # Classes & Resources
 LISTING_STATUS   = "1"   # published
 ACTIVE_USER      = "2"   # active member
-MAX_USER_ID      = 300   # probe up to this ID; safe upper bound
+MAX_USER_ID      = 00   # probe up to this ID; safe upper bound
 
 MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
@@ -44,7 +44,7 @@ SNIPPET_CHARS    = 205
 FORMAT_MAP = {
     "1": "1-on-1 Teaching",
     "2": "Tutoring",
-    "3": "Self Paced Classes",
+    "": "Self Paced Classes",
     "4": "Online Group Classes",
     "5": "Resources",
     "6": "Coaching & Mentoring",
@@ -59,7 +59,7 @@ COHORT_SIZE_MAP = {
 GRADE_MAP = {
     "prek":            "Pre-K",
     "k2":              "K-2",
-    "gr_36":           "Gr 3-5",
+    "gr_6":           "Gr 3-5",
     "gr_68":           "Gr 6-8",
     "gr_912":          "Gr 9-12",
     "postsecondary":   "Post-Secondary",
@@ -422,7 +422,7 @@ def main():
             print(f"  listings error for user_id={uid}: {e}")
 
         # FIX: increased from 2.0s to 3.0s to reduce 429s during listing fetch loop
-        time.(3.0)
+        time.sleep(3.0)
 
     print(f"\n{len(listing_records)} listing records to push")
     print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
