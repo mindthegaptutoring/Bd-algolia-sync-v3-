@@ -180,7 +180,7 @@ def get_all_active_users(total_members: int) -> list:
                 if is_active and name and sub_id not in ("4", "7"):
                     users.append(user)
                 # FIX: increased from 0.15s to 0.5s to reduce 429s during probe
-                time.sleep(0.5)
+                time.sleep(0.8)
             else:
                 consecutive_misses += 1
                 if len(users) > 0 and consecutive_misses >= 20:
@@ -191,7 +191,7 @@ def get_all_active_users(total_members: int) -> list:
             print(f"  user_id={uid} error: {e}")
             consecutive_misses += 1
             # FIX: extra pause after any error during probe to let BD recover
-            time.sleep(1.0)
+            time.sleep(1.5)
 
     return users
 
@@ -228,7 +228,7 @@ def get_user_listings(user_id: str) -> list:
 
         if next_page and current < total_pages:
             page_cursor = next_page
-            time.sleep(0.3)
+            time.sleep(0.8)
         else:
             break
 
@@ -422,7 +422,7 @@ def main():
             print(f"  listings error for user_id={uid}: {e}")
 
         # FIX: increased from 2.0s to 3.0s to reduce 429s during listing fetch loop
-        time.sleep(3.0)
+        time.(3.0)
 
     print(f"\n{len(listing_records)} listing records to push")
     print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
