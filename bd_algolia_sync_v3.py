@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Optimized BD → Algolia sync script
-- Uses robust API pagination instead of fragile ID guessing
-- Requests active users explicitly from the database layer
+Robust BD → Algolia sync script
+- Bypasses unreliable HTML search payloads by targeting clear User ID increments
+- Scans systematically through numerical IDs without fragile early-cutoff rules
 - Retries on 429/5xx with exponential backoff
-- Designed for Render cron or GitHub Actions
+- Designed for GitHub Actions workflows
 """
 
 import os
@@ -34,6 +34,10 @@ BD_HEADERS = {
 LISTING_DATA_ID  = "6"   # Classes & Resources
 LISTING_STATUS   = "1"   # published
 ACTIVE_USER      = "2"   # active member
+
+# ID Scanning Ranges
+START_USER_ID    = 1
+MAX_USER_ID      = 350   # Set this high enough to capture your newest educators
 
 MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
@@ -126,9 +130,6 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
 def bd_get(endpoint: str, params: dict = None) -> dict:
     return bd_request("GET", endpoint, params=params)
 
-def bd_post(endpoint: str, body: dict) -> dict:
-    return bd_request("POST", endpoint, body=body)
-
 # ── Image URL helper ──────────────────────────────────────────────────────────
 
 def resolve_image_url(raw: str) -> str:
@@ -143,57 +144,38 @@ def resolve_image_url(raw: str) -> str:
 
 def get_all_active_users() -> list:
     users = []
-    limit = 50  
-    offset = 0
+    print(f"  Scanning numerical profiles systematically from ID {START_USER_ID} to {MAX_USER_ID}...")
 
-    print("  Fetching batches from search API...")
-    
-    while True:
+    for uid in range(START_USER_ID, MAX_USER_ID + 1):
         try:
-            # Explicitly filtering for status 2 (Active) directly in the API call
-            data = bd_post("/user/search", {
-                "limit": limit,
-                "offset": offset,
-                "status": "2"
-            })
+            data = bd_get("/user/get", {"user_id": str(uid)})
+            msg = data.get("message")
             
-            # Print response structure diagnostics to output logs
-            print(f"  [Debug] API Response top-level keys at offset {offset}: {list(data.keys())}")
-            
-            msg = data.get("message") or []
-            
-            if isinstance(msg, str):
-                print(f"  [Debug] API returned string alert instead of array: '{msg}'")
-                break
-                
-            if not msg or not isinstance(msg, list):
-                break  
+            if not msg or not isinstance(msg, dict):
+                # Simply skip if no user data structure is returned for this numerical slot
+                continue
 
-            print(f"  [Debug] Found {len(msg)} raw profiles in this API chunk.")
+            first = msg.get('first_name', '')
+            last = msg.get('last_name', '')
+            name = f"{first} {last}".strip()
+            sub_id = str(msg.get("subscription_id", ""))
+            active_status = str(msg.get("active", ""))
+            is_active = (active_status == ACTIVE_USER)
 
-            for user in msg:
-                uid = str(user.get("user_id", ""))
-                first = user.get('first_name', '')
-                last = user.get('last_name', '')
-                name = f"{first} {last}".strip()
-                sub_id = str(user.get("subscription_id", ""))
-                
-                # Validation checks against name and internal plan bans
-                if name and sub_id not in ("4", "7"):
-                    users.append(user)
-                else:
-                    print(f"  ⚠️ Skipped user_id={uid} ({name or 'No Name'}). Reason -> Sub ID: '{sub_id}'")
-
-            if len(msg) < limit:
-                break  
-                
-            offset += limit
-            time.sleep(1.0)  
+            # Filtering matches
+            if is_active and name and sub_id not in ("4", "7"):
+                users.append(msg)
+                print(f"  ✅ Picked up active educator: ID={uid} ({name})")
+            else:
+                # Debug output to check validation filters on found users
+                if name:
+                    print(f"  ⚠️ Skipped user_id={uid} ({name}). Reason -> Active: {is_active}, Sub ID: '{sub_id}'")
 
         except Exception as e:
-            print(f"  Error fetching user batch at offset {offset}: {e}")
-            time.sleep(5.0)
-            break 
+            print(f"  Error inspecting ID context {uid}: {e}")
+        
+        # Safe small delay between specific object gets
+        time.sleep(0.15)
 
     return users
 
@@ -273,42 +255,6 @@ def resolve_tags(tags_str: str) -> list:
     return [t.strip() for t in tags_str.split(",") if t.strip()]
 
 # ── Record builders ───────────────────────────────────────────────────────────
-
-def build_educator_record(user: dict) -> dict:
-    uid = str(user.get("user_id", ""))
-    bio = strip_html(user.get("about_me") or "")[:BIO_CHAR_LIMIT]
-    profile_photo = resolve_image_url(user.get("image_main_file") or "")
-
-    record = {
-        "objectID":           f"educator_{uid}",
-        "type":               "educator",
-        "user_id":            uid,
-        "name":               f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
-        "company":            (user.get("company") or "").strip(),
-        "bio":                bio,
-        "search_description": (user.get("search_description") or "").strip(),
-        "city":               (user.get("city") or "").strip(),
-        "state":              (user.get("state_ln") or "").strip(),
-        "country":            (user.get("country_ln") or "").strip(),
-        "website":            (user.get("website") or "").strip(),
-        "instagram":          (user.get("instagram") or "").strip(),
-        "profile_url":        f"{BD_BASE}/{user.get('filename', '').lstrip('/')}",
-        "profile_photo":      profile_photo,
-        "listing_type":       (user.get("listing_type") or "").strip(),
-        "active":             user.get("active"),
-        "signup_date":        user.get("signup_date", ""),
-        "random_rank":        random.randint(1, 1000000),
-    }
-
-    lat = user.get("lat")
-    lon = user.get("lon")
-    if lat and lon:
-        try:
-            record["_geoloc"] = {"lat": float(lat), "lng": float(lon)}
-        except (ValueError, TypeError):
-            pass
-
-    return record
 
 def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     gid         = str(listing.get("group_id") or "")
@@ -396,7 +342,7 @@ def main():
     for i, user in enumerate(users, 1):
         uid  = str(user.get("user_id", ""))
         name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
-        print(f"[{i}/{len(users)}] Processing: {name} (user_id={uid})")
+        print(f"[{i}/{len(users)}] Processing Listings for: {name} (user_id={uid})")
 
         try:
             all_listings = get_user_listings(uid)
@@ -415,12 +361,17 @@ def main():
         except Exception as e:
             print(f"  listings error for user_id={uid}: {e}")
 
-        time.sleep(3.0)
+        # Safe throttling between users to avoid webhook blocks
+        time.sleep(2.0)
 
     print(f"\nTotal records prepared: {len(listing_records)}")
-    print(f"Replacing index '{ALGOLIA_INDEX_NAME}' via Algolia atomic replace...")
-    index.replace_all_objects(listing_records)
-    print("Index sync completely successful.")
+    
+    if listing_records:
+        print(f"Replacing index '{ALGOLIA_INDEX_NAME}' via Algolia atomic replace...")
+        index.replace_all_objects(listing_records)
+        print("Index sync completely successful.")
+    else:
+        print("⚠️ No valid records found to index. Skipping Algolia replacement to protect live data.")
 
 
 if __name__ == "__main__":
