@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Fail-Safe BD → Algolia Sync
-- Forces real-time log flushing (`flush=True`)
-- Sets a hard limit on HTML search pages to prevent infinite hanging
-- Safely processes discovered educator profiles
+Optimized BD → Algolia sync script
+- Retries on 429/5xx with exponential backoff
+- Minimizes sleeps while staying rate-limit safe
+- Designed for Render cron (hourly or 2-hourly)
 """
 
 import os
@@ -33,6 +33,7 @@ BD_HEADERS = {
 LISTING_DATA_ID  = "6"   # Classes & Resources
 LISTING_STATUS   = "1"   # published
 ACTIVE_USER      = "2"   # active member
+MAX_USER_ID      = 300   # probe up to this ID; safe upper bound
 
 MAX_RECORD_BYTES = 9_500
 BIO_CHAR_LIMIT   = 500
@@ -101,7 +102,7 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
             if resp.status_code in (429, 500, 502, 503, 504):
                 jitter = random.uniform(0.5, 1.5)
                 delay = (base_delay * (2 ** attempt)) * jitter
-                print(f"  BD {resp.status_code}, retrying in {delay:.1f}s…", flush=True)
+                print(f"  BD {resp.status_code}, retrying in {delay:.1f}s…")
                 time.sleep(delay)
                 continue
 
@@ -112,11 +113,11 @@ def bd_request(method: str, endpoint: str, *, params=None, body=None,
         except HTTPError as e:
             if e.response.status_code == 400 and "users_portfolio_groups" in endpoint:
                 raise
-            print(f"  HTTP error on {endpoint}: {e}", flush=True)
+            print(f"  HTTP error on {endpoint}: {e}")
             raise
         except RequestException as e:
             delay = base_delay * (2 ** attempt)
-            print(f"  Network error on {endpoint}: {e}, retrying in {delay:.1f}s…", flush=True)
+            print(f"  Network error on {endpoint}: {e}, retrying in {delay:.1f}s…")
             time.sleep(delay)
             continue
 
@@ -131,6 +132,12 @@ def bd_post(endpoint: str, body: dict) -> dict:
 # ── Image URL helper ──────────────────────────────────────────────────────────
 
 def resolve_image_url(raw: str) -> str:
+    """
+    Always return a full absolute URL for profile photos.
+    BD sometimes returns a relative path like 'pictures/profile/pimage-xx.png'.
+    Storing a relative path causes the GitHub Pages widget to double-prefix it.
+    If it already starts with http, return as-is.
+    """
     if not raw:
         return ""
     raw = raw.strip()
@@ -138,68 +145,54 @@ def resolve_image_url(raw: str) -> str:
         return raw
     return f"{BD_BASE}/{raw.lstrip('/')}"
 
-# ── User discovery via Real-Time HTML Parse ───────────────────────────────────
+# ── User discovery ────────────────────────────────────────────────────────────
 
-def get_all_active_users() -> list:
-    discovered_ids = set()
-    limit = 30
-    offset = 0
-    
-    print("  Scouting active users from HTML payload...", flush=True)
-    
-    # Safety Valve: Do not process more than 15 pages to completely rule out infinite loops
-    for page_run in range(15):
-        try:
-            print(f"  [Scan] Querying offset {offset} (Page {page_run + 1})...", flush=True)
-            data = bd_post("/user/search", {"limit": limit, "offset": offset, "status": "2"})
-            html_content = data.get("message") or ""
-            
-            if not isinstance(html_content, str) or not html_content.strip():
-                print("  [Scan] Hit empty message body. Ending search loop.", flush=True)
-                break
-            
-            found_ids = re.findall(r"pimage-(\d+)-", html_content)
-            if not found_ids:
-                print("  [Scan] No profile images located in this block.", flush=True)
-                break
-                
-            page_distinct = set(int(uid) for uid in found_ids)
-            print(f"  [Scan] Found user IDs in this page: {list(page_distinct)}", flush=True)
-            
-            # If we aren't pulling new IDs, the offset isn't moving rows on the BD side
-            if page_distinct.issubset(discovered_ids):
-                print("  [Scan] Data repeating without fresh records. Breaking out.", flush=True)
-                break
-                
-            discovered_ids.update(page_distinct)
-            
-            offset += limit
-            time.sleep(1.0)
-        except Exception as e:
-            print(f"  Scouting breakdown at offset {offset}: {e}", flush=True)
+def get_total_member_count() -> int:
+    try:
+        data = bd_post("/user/search", {"limit": 1})
+        total = int(data.get("total_members") or 0)
+        return max(total, 0)
+    except Exception as e:
+        print(f"  Could not get total member count, falling back to MAX_USER_ID: {e}")
+        return MAX_USER_ID
+
+def get_all_active_users(total_members: int) -> list:
+    users = []
+    consecutive_misses = 0
+
+    for uid in range(1, MAX_USER_ID + 1):
+        if len(users) >= total_members and total_members > 0:
             break
 
-    sorted_ids = sorted(list(discovered_ids))
-    print(f"\n🎯 Extraction complete. Found {len(sorted_ids)} target IDs: {sorted_ids}\n", flush=True)
-
-    users = []
-    for uid in sorted_ids:
         try:
-            data = bd_get("/user/get", {"user_id": str(uid)})
-            msg = data.get("message")
-            if msg and isinstance(msg, dict):
-                first = msg.get('first_name', '')
-                last = msg.get('last_name', '')
-                name = f"{first} {last}".strip()
-                sub_id = str(msg.get("subscription_id", ""))
-                
-                if name and sub_id not in ("4", "7"):
-                    users.append(msg)
-                    print(f"  Read profile: ID={uid} ({name})", flush=True)
+            data = bd_get("/user/get", params={
+                "property":       "user_id",
+                "property_value": str(uid),
+            })
+            msg = data.get("message") or []
+            user = msg[0] if isinstance(msg, list) and msg else None
+
+            if user:
+                consecutive_misses = 0
+                name   = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+                sub_id = str(user.get("subscription_id", ""))
+                is_active = str(user.get("active", "")) == ACTIVE_USER
+                if is_active and name and sub_id not in ("4", "7"):
+                    users.append(user)
+                # FIX: increased from 0.15s to 0.5s to reduce 429s during probe
+                time.sleep(0.5)
+            else:
+                consecutive_misses += 1
+                if len(users) > 0 and consecutive_misses >= 20:
+                    print(f"  20 consecutive misses after user_id={uid - 1}, stopping probe.")
+                    break
+
         except Exception as e:
-            print(f"  Failed reading precise profile data for ID {uid}: {e}", flush=True)
-        time.sleep(0.2)
-        
+            print(f"  user_id={uid} error: {e}")
+            consecutive_misses += 1
+            # FIX: extra pause after any error during probe to let BD recover
+            time.sleep(1.0)
+
     return users
 
 # ── Listing fetcher ───────────────────────────────────────────────────────────
@@ -235,7 +228,7 @@ def get_user_listings(user_id: str) -> list:
 
         if next_page and current < total_pages:
             page_cursor = next_page
-            time.sleep(0.8)
+            time.sleep(0.3)
         else:
             break
 
@@ -279,6 +272,43 @@ def resolve_tags(tags_str: str) -> list:
 
 # ── Record builders ───────────────────────────────────────────────────────────
 
+def build_educator_record(user: dict) -> dict:
+    uid = str(user.get("user_id", ""))
+    bio = strip_html(user.get("about_me") or "")[:BIO_CHAR_LIMIT]
+    # FIX: resolve to absolute URL to prevent doubled path in GitHub Pages widget
+    profile_photo = resolve_image_url(user.get("image_main_file") or "")
+
+    record = {
+        "objectID":           f"educator_{uid}",
+        "type":               "educator",
+        "user_id":            uid,
+        "name":               f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+        "company":            (user.get("company") or "").strip(),
+        "bio":                bio,
+        "search_description": (user.get("search_description") or "").strip(),
+        "city":               (user.get("city") or "").strip(),
+        "state":              (user.get("state_ln") or "").strip(),
+        "country":            (user.get("country_ln") or "").strip(),
+        "website":            (user.get("website") or "").strip(),
+        "instagram":          (user.get("instagram") or "").strip(),
+        "profile_url":        f"{BD_BASE}/{user.get('filename', '').lstrip('/')}",
+        "profile_photo":      profile_photo,
+        "listing_type":       (user.get("listing_type") or "").strip(),
+        "active":             user.get("active"),
+        "signup_date":        user.get("signup_date", ""),
+        "random_rank":        random.randint(1, 1000000),
+    }
+
+    lat = user.get("lat")
+    lon = user.get("lon")
+    if lat and lon:
+        try:
+            record["_geoloc"] = {"lat": float(lat), "lng": float(lon)}
+        except (ValueError, TypeError):
+            pass
+
+    return record
+
 def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     gid         = str(listing.get("group_id") or "")
     title       = (listing.get("group_name") or "").strip()
@@ -318,7 +348,7 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     cohort_size = [COHORT_SIZE_MAP.get(c, c) for c in cohort_raw]
 
     record = {
-        "objectID":          f"listing_{gid}",
+        "objectID":         f"listing_{gid}",
         "type":              "listing",
         "group_id":          gid,
         "user_id":           str(listing.get("user_id") or ""),
@@ -344,6 +374,7 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "city":              city,
         "state":             state,
         "country":           country,
+        # FIX: educator_photo is now always a full absolute URL (resolved upstream)
         "profile_photo":     educator_photo,
         "random_rank":       random.randint(1, 1000000),
     }
@@ -356,16 +387,20 @@ def main():
     client = SearchClient.create(ALGOLIA_APP_ID, ALGOLIA_WRITE_KEY)
     index  = client.init_index(ALGOLIA_INDEX_NAME)
 
-    print("Beginning system scans for active educators…", flush=True)
-    users = get_all_active_users()
-    print(f"\nScan complete: {len(users)} active educators passed filters.\n", flush=True)
+    print("Getting total member count…")
+    total_members = get_total_member_count()
+    print(f"{total_members} total members (approx)\n")
+
+    print(f"Probing user IDs 1–{MAX_USER_ID}…")
+    users = get_all_active_users(total_members)
+    print(f"{len(users)} active educators found\n")
 
     listing_records = []
 
     for i, user in enumerate(users, 1):
         uid  = str(user.get("user_id", ""))
         name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
-        print(f"[{i}/{len(users)}] Processing Listings for: {name} (user_id={uid})", flush=True)
+        print(f"[{i}/{len(users)}] {name} (user_id={uid})")
 
         try:
             all_listings = get_user_listings(uid)
@@ -375,25 +410,24 @@ def main():
                 and str(l.get("data_id")) == LISTING_DATA_ID
             ]
             if not published:
-                print("  no matching published listings", flush=True)
+                print("  no listings")
             else:
+                # FIX: resolve photo to absolute URL here, passed down to build_listing_record
                 educator_photo = resolve_image_url(user.get("image_main_file") or "")
+                print(f"  profile_photo: {repr(educator_photo)}")
                 for listing in published:
                     listing_records.append(build_listing_record(listing, educator_photo))
-                print(f"  Added {len(published)} listings", flush=True)
+                print(f"  {len(published)} published listings")
         except Exception as e:
-            print(f"  listings error for user_id={uid}: {e}", flush=True)
+            print(f"  listings error for user_id={uid}: {e}")
 
-        time.sleep(1.5)
+        # FIX: increased from 2.0s to 3.0s to reduce 429s during listing fetch loop
+        time.sleep(3.0)
 
-    print(f"\nTotal records prepared: {len(listing_records)}", flush=True)
-    
-    if listing_records:
-        print(f"Replacing index '{ALGOLIA_INDEX_NAME}' via Algolia atomic replace...", flush=True)
-        index.replace_all_objects(listing_records)
-        print("Index sync completely successful.", flush=True)
-    else:
-        print("⚠️ No valid records found to index. Skipping Algolia replacement to protect live data.", flush=True)
+    print(f"\n{len(listing_records)} listing records to push")
+    print(f"\nReplacing index '{ALGOLIA_INDEX_NAME}' with {len(listing_records)} listings…")
+    index.replace_all_objects(listing_records)
+    print("Index replaced. Sync complete.")
 
 
 if __name__ == "__main__":
