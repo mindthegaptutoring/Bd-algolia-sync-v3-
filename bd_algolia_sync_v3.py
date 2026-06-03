@@ -2,9 +2,9 @@
 """
 Optimized BD → Algolia sync script
 - Uses robust API pagination instead of fragile ID guessing
+- Requests active users explicitly from the database layer
 - Retries on 429/5xx with exponential backoff
-- Minimizes sleeps while staying rate-limit safe
-- Designed for Render cron (hourly or 2-hourly)
+- Designed for Render cron or GitHub Actions
 """
 
 import os
@@ -150,14 +150,26 @@ def get_all_active_users() -> list:
     
     while True:
         try:
+            # Explicitly filtering for status 2 (Active) directly in the API call
             data = bd_post("/user/search", {
                 "limit": limit,
-                "offset": offset
+                "offset": offset,
+                "status": "2"
             })
             
+            # Print response structure diagnostics to output logs
+            print(f"  [Debug] API Response top-level keys at offset {offset}: {list(data.keys())}")
+            
             msg = data.get("message") or []
+            
+            if isinstance(msg, str):
+                print(f"  [Debug] API returned string alert instead of array: '{msg}'")
+                break
+                
             if not msg or not isinstance(msg, list):
                 break  
+
+            print(f"  [Debug] Found {len(msg)} raw profiles in this API chunk.")
 
             for user in msg:
                 uid = str(user.get("user_id", ""))
@@ -165,17 +177,12 @@ def get_all_active_users() -> list:
                 last = user.get('last_name', '')
                 name = f"{first} {last}".strip()
                 sub_id = str(user.get("subscription_id", ""))
-                active_status = str(user.get("active", ""))
-                is_active = (active_status == ACTIVE_USER)
                 
-                # Filter validation check
-                if is_active and name and sub_id not in ("4", "7"):
+                # Validation checks against name and internal plan bans
+                if name and sub_id not in ("4", "7"):
                     users.append(user)
                 else:
-                    # Debug print to reveal skipped profiles
-                    print(f"  ⚠️ Skipped user_id={uid} ({name or 'No Name'}). Reason -> "
-                          f"Active: {is_active} (Status value: '{active_status}'), "
-                          f"Sub ID: '{sub_id}'")
+                    print(f"  ⚠️ Skipped user_id={uid} ({name or 'No Name'}). Reason -> Sub ID: '{sub_id}'")
 
             if len(msg) < limit:
                 break  
