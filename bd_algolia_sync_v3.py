@@ -157,13 +157,22 @@ def get_total_member_count() -> int:
         return MAX_USER_ID
 
 def get_all_active_users(total_members: int) -> list:
+    """
+    Probe user IDs 1..MAX_USER_ID sequentially.
+
+    FIX: Removed the early-exit based on len(users) >= total_members.
+    BD's total_members count includes admins, blog authors, waitlist, and
+    inactive accounts — all of which get filtered out before appending to
+    `users`. If those excluded accounts have lower IDs than real educators,
+    the counter runs out early and educators at the high end of the ID space
+    are never reached. Now we rely purely on consecutive-miss logic to stop.
+    """
     users = []
     consecutive_misses = 0
 
-    for uid in range(1, MAX_USER_ID + 1):
-        if len(users) >= total_members and total_members > 0:
-            break
+    print(f"  (BD reports {total_members} total accounts — used for info only, not as stop condition)")
 
+    for uid in range(1, MAX_USER_ID + 1):
         try:
             data = bd_get("/user/get", params={
                 "property":       "user_id",
@@ -179,7 +188,6 @@ def get_all_active_users(total_members: int) -> list:
                 is_active = str(user.get("active", "")) == ACTIVE_USER
                 if is_active and name and sub_id not in ("4", "7"):
                     users.append(user)
-                # FIX: increased from 0.15s to 0.5s to reduce 429s during probe
                 time.sleep(0.5)
             else:
                 consecutive_misses += 1
@@ -190,9 +198,9 @@ def get_all_active_users(total_members: int) -> list:
         except Exception as e:
             print(f"  user_id={uid} error: {e}")
             consecutive_misses += 1
-            # FIX: extra pause after any error during probe to let BD recover
             time.sleep(1.0)
 
+    print(f"  Probe complete. Last uid checked: {uid}. Active educators found: {len(users)}")
     return users
 
 # ── Listing fetcher ───────────────────────────────────────────────────────────
@@ -275,7 +283,6 @@ def resolve_tags(tags_str: str) -> list:
 def build_educator_record(user: dict) -> dict:
     uid = str(user.get("user_id", ""))
     bio = strip_html(user.get("about_me") or "")[:BIO_CHAR_LIMIT]
-    # FIX: resolve to absolute URL to prevent doubled path in GitHub Pages widget
     profile_photo = resolve_image_url(user.get("image_main_file") or "")
 
     record = {
@@ -374,7 +381,6 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "city":              city,
         "state":             state,
         "country":           country,
-        # FIX: educator_photo is now always a full absolute URL (resolved upstream)
         "profile_photo":     educator_photo,
         "random_rank":       random.randint(1, 1000000),
     }
@@ -389,7 +395,7 @@ def main():
 
     print("Getting total member count…")
     total_members = get_total_member_count()
-    print(f"{total_members} total members (approx)\n")
+    print(f"{total_members} total accounts reported by BD\n")
 
     print(f"Probing user IDs 1–{MAX_USER_ID}…")
     users = get_all_active_users(total_members)
@@ -412,7 +418,6 @@ def main():
             if not published:
                 print("  no listings")
             else:
-                # FIX: resolve photo to absolute URL here, passed down to build_listing_record
                 educator_photo = resolve_image_url(user.get("image_main_file") or "")
                 print(f"  profile_photo: {repr(educator_photo)}")
                 for listing in published:
@@ -421,7 +426,6 @@ def main():
         except Exception as e:
             print(f"  listings error for user_id={uid}: {e}")
 
-        # FIX: increased from 2.0s to 3.0s to reduce 429s during listing fetch loop
         time.sleep(3.0)
 
     print(f"\n{len(listing_records)} listing records to push")
