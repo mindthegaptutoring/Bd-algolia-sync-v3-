@@ -1,9 +1,12 @@
 services: []
 
+# Reference only — the live cron job (crn-d7br66c50q8c73ffi170) was created
+# manually in the Render dashboard and is not deployed from this file.
+# https://dashboard.render.com/cron/crn-d7br66c50q8c73ffi170
 cronJobs:
   - name: bd-algolia-sync
-    schedule: "0 * * * *"   # every hour
-    command: "python bd_algolia_sync.py"
+    schedule: "*/45 * * * *"   # every 45 minutes
+    command: "python bd_algolia_sync_v3.py"
     envVars:
       - key: BD_API_KEY
         sync: false
