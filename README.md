@@ -32,5 +32,4 @@ Algolia index `BD_class_posts`, which powers the
 |---|---|
 | `bd_algolia_sync_v3.py` | The sync script — this is what the Render Cron Job runs. |
 | `render.yaml` | Blueprint reference config, kept in sync with the live cron job's schedule/command. Not currently used to deploy (the live job was created manually in Render). |
-| `.github/workflows/sync.yml` | Manual-dispatch GitHub Action for running the sync on demand. Not used for the recurring schedule — Render owns that. |
 | `requirements.txt` | Python dependencies. |
