@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.2.0
+Version: 1.3.0
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -13,6 +13,15 @@ Version: 1.2.0
           Reviews / etc.), using GA4 Enhanced Measurement's existing "Outbound
           clicks" tracking — requires the "Link Domain" custom dimension to be
           registered in GA4 Admin first (see SETUP_GUIDE.md); does not backfill
+  1.3.0 — switched triage from fixed absolute thresholds to percentile-based
+          cutoffs computed fresh each run, separately for profiles vs listings.
+          Fixed thresholds were sized for a much bigger site (max real
+          impressions ever seen: 23, vs. a 10-impression floor and a
+          50-impression ceiling in the old logic) and caught 89% of listings
+          in a single "low_visibility" bucket regardless of actual relative
+          performance. main() is now two passes: collect all data, then
+          compute + apply thresholds, so the cutoffs reflect this run's real
+          distribution instead of a guess.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as a single JSON file that both
 the educator-facing dashboard widget and Kristen's admin triage widget can
@@ -82,13 +91,18 @@ TRACK_CONNECT_PAGEVIEWS = True  # BD's native "Send Message" button has no click
 TRACK_OUTBOUND_CLICKS = True  # requires the "Link Domain" custom dimension registered in GA4 Admin (see SETUP_GUIDE.md) — safe to leave True even before that's done, the call just fails gracefully per-listing until then
 
 # ---------------------------------------------------------------------------
-# TRIAGE THRESHOLDS — change these freely, logic below doesn't need to change
+# TRIAGE THRESHOLDS — percentile-based, computed fresh from THIS run's own
+# data (see compute_thresholds below), not fixed numbers. Profile pages and
+# Classes & Resources listings get their own separate cutoffs, since they
+# have different baseline traffic patterns and shouldn't be judged against
+# each other. Change the percentiles below any time — nothing else needs to
+# change to retune them, and they self-adjust as the site's traffic grows
+# instead of needing periodic manual recalibration.
 # ---------------------------------------------------------------------------
-LOW_VISIBILITY_MAX_IMPRESSIONS = 10       # fewer than this in 28d = not being found
-HIGH_IMPRESSIONS_MIN = 50                 # "enough impressions to judge CTR"
-LOW_CTR_THRESHOLD = 0.02                  # below 2% CTR with decent impressions = weak title/description
-LOW_ENGAGEMENT_MIN_SESSIONS = 10          # enough sessions to judge engagement
-LOW_ENGAGEMENT_MAX_SECONDS = 15           # avg engagement time below this = mismatch between listing & page
+LOW_VISIBILITY_PERCENTILE = 25    # bottom this % of impressions, within post_type = low_visibility
+HIGH_VISIBILITY_PERCENTILE = 75   # top this % of impressions, within post_type = "enough traffic to judge CTR on"
+LOW_CTR_PERCENTILE = 25           # bottom this % of CTR (among listings with any impressions) = weak title/description
+LOW_ENGAGEMENT_PERCENTILE = 25    # bottom this % of avg engagement (among listings with any sessions) = content/offer mismatch
 
 # ---------------------------------------------------------------------------
 # 1. Pull all listings + member IDs from BD
@@ -421,9 +435,44 @@ def get_ga4_stats(ga4_client, url):
 
 
 # ---------------------------------------------------------------------------
-# 5. Triage logic
+# 5. Triage logic — percentile-based, computed fresh from this run's data
 # ---------------------------------------------------------------------------
-def triage(gsc, ga4):
+def percentile(sorted_values, p):
+    """Nearest-rank percentile on an already-sorted list. p is 0-100."""
+    if not sorted_values:
+        return 0
+    idx = min(int(len(sorted_values) * p / 100), len(sorted_values) - 1)
+    return sorted_values[idx]
+
+
+def compute_thresholds(results):
+    """
+    One set of percentile cutoffs per post_type (profile vs listing),
+    computed from this run's own data only — not shared across the two
+    groups, and not carried over between runs. This is what makes the
+    triage flag stay meaningful as the site's traffic grows: the cutoffs
+    move with the site instead of being fixed numbers that need periodic
+    manual retuning.
+    """
+    thresholds = {}
+    for post_type in ("profile", "listing"):
+        group = [r for r in results if r.get("post_type") == post_type and "gsc" in r and "ga4" in r]
+        impressions = sorted(r["gsc"]["impressions"] for r in group)
+        ctrs = sorted(r["gsc"]["ctr"] for r in group if r["gsc"]["impressions"] > 0)
+        sessions = sorted(r["ga4"]["sessions"] for r in group)
+        engagements = sorted(r["ga4"]["avg_engagement_seconds"] for r in group if r["ga4"]["sessions"] > 0)
+        thresholds[post_type] = {
+            "low_visibility_max": percentile(impressions, LOW_VISIBILITY_PERCENTILE),
+            "high_visibility_min": percentile(impressions, HIGH_VISIBILITY_PERCENTILE),
+            "low_ctr_max": percentile(ctrs, LOW_CTR_PERCENTILE),
+            "meaningful_sessions_min": percentile(sessions, 50),
+            "low_engagement_max": percentile(engagements, LOW_ENGAGEMENT_PERCENTILE),
+            "sample_size": len(group),
+        }
+    return thresholds
+
+
+def triage(gsc, ga4, t):
     impressions = gsc["impressions"]
     ctr = gsc["ctr"]
     sessions = ga4["sessions"]
@@ -431,12 +480,12 @@ def triage(gsc, ga4):
 
     if impressions == 0 and sessions == 0:
         return "new_no_data"
-    if impressions < LOW_VISIBILITY_MAX_IMPRESSIONS:
-        return "low_visibility"          # not being found -- check title/keywords
-    if impressions >= HIGH_IMPRESSIONS_MIN and ctr < LOW_CTR_THRESHOLD:
-        return "high_impressions_low_ctr"  # showing up, not clicked -- title/description needs work
-    if sessions >= LOW_ENGAGEMENT_MIN_SESSIONS and avg_eng < LOW_ENGAGEMENT_MAX_SECONDS:
-        return "low_engagement"          # clicked, then leaves -- content/offer mismatch
+    if impressions <= t["low_visibility_max"]:
+        return "low_visibility"          # bottom of this post_type's own range -- check title/keywords
+    if impressions >= t["high_visibility_min"] and ctr <= t["low_ctr_max"]:
+        return "high_impressions_low_ctr"  # showing up more than most peers, clicked less -- title/description needs work
+    if sessions >= t["meaningful_sessions_min"] and avg_eng <= t["low_engagement_max"]:
+        return "low_engagement"          # clicked, then leaves faster than most peers -- content/offer mismatch
     return "healthy"
 
 
@@ -475,6 +524,9 @@ def main():
     listings = get_bd_listings()
     results = []
 
+    # Pass 1: collect every listing's raw GSC/GA4 data. No triage flag yet --
+    # the percentile cutoffs below can only be computed once this run's full
+    # distribution is known.
     for listing in listings:
         try:
             gsc = get_gsc_stats(gsc_service, listing["url"])
@@ -491,15 +543,24 @@ def main():
                     print(f"  outbound click breakdown unavailable ({e}) — register the Link Domain custom dimension in GA4 Admin")
             else:
                 ga4["outbound_clicks_by_domain"] = None
-            flag = triage(gsc, ga4)
-            results.append({**listing, "gsc": gsc, "ga4": ga4, "triage_flag": flag})
+            results.append({**listing, "gsc": gsc, "ga4": ga4})
         except Exception as e:
             # One bad URL shouldn't kill the whole run
             results.append({**listing, "error": str(e)})
 
+    # Pass 2: compute this run's own percentile cutoffs, then apply them.
+    thresholds = compute_thresholds(results)
+    print(f"  Triage thresholds this run — profile: {thresholds['profile']}, listing: {thresholds['listing']}")
+    for r in results:
+        if "gsc" in r and "ga4" in r:
+            r["triage_flag"] = triage(r["gsc"], r["ga4"], thresholds[r["post_type"]])
+        else:
+            r["triage_flag"] = "error"
+
     payload = {
         "generated_at": date.today().isoformat(),
         "lookback_days": LOOKBACK_DAYS,
+        "triage_thresholds": thresholds,  # published for transparency — the exact cutoffs this run used, by post_type
         "listings": results,
     }
     publish_to_github(payload)
