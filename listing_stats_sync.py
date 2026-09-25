@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.1.0
+Version: 1.2.0
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -9,6 +9,10 @@ Version: 1.1.0
           native "Send Message" flow (tracked as a /connect pageview, not a
           click event); switched Google auth from an env-var JSON string to a
           Render Secret File
+  1.2.0 — added outbound-click breakdown by domain (Visit Website / Read Google
+          Reviews / etc.), using GA4 Enhanced Measurement's existing "Outbound
+          clicks" tracking — requires the "Link Domain" custom dimension to be
+          registered in GA4 Admin first (see SETUP_GUIDE.md); does not backfill
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as a single JSON file that both
 the educator-facing dashboard widget and Kristen's admin triage widget can
@@ -44,7 +48,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
-    RunReportRequest, DateRange, Dimension, Metric, FilterExpression, Filter
+    RunReportRequest, DateRange, Dimension, Metric, FilterExpression, Filter, FilterExpressionList
 )
 
 # ---------------------------------------------------------------------------
@@ -75,6 +79,7 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 LOOKBACK_DAYS = 28
 CONTACT_EVENT_NAME = "mailto_click"  # confirmed live sitewide — fires on any a[href^="mailto:"] click, anywhere on the page
 TRACK_CONNECT_PAGEVIEWS = True  # BD's native "Send Message" button has no click event, just navigates to <profile_url>/connect — pull as a pageview instead
+TRACK_OUTBOUND_CLICKS = True  # requires the "Link Domain" custom dimension registered in GA4 Admin (see SETUP_GUIDE.md) — safe to leave True even before that's done, the call just fails gracefully per-listing until then
 
 # ---------------------------------------------------------------------------
 # TRIAGE THRESHOLDS — change these freely, logic below doesn't need to change
@@ -314,6 +319,39 @@ def get_connect_pageviews(ga4_client, profile_url):
     return int(resp.rows[0].metric_values[0].value) if resp.rows else 0
 
 
+def get_outbound_click_stats(ga4_client, url):
+    """
+    Breaks down GA4 Enhanced Measurement's automatic "Outbound clicks" events
+    by destination domain for one page — e.g. {"mindthegaptutoring.ca": 4,
+    "google.com": 1} — which is exactly the Visit Website vs. Read Google
+    Reviews vs. anything-else split needed to test the "do parents skip BD's
+    contact flow for the educator's own site" question.
+
+    Requires the "Link Domain" custom dimension (event-scoped, mapped to the
+    link_domain event parameter) to be registered in GA4 Admin first — see
+    SETUP_GUIDE.md. Until it's registered, GA4's API rejects the dimension
+    name outright; the caller catches that and treats it as "not ready yet"
+    rather than a real error.
+    """
+    path = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=LOOKBACK_DAYS)
+    req = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        dimensions=[Dimension(name="customEvent:link_domain")],
+        metrics=[Metric(name="eventCount")],
+        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+        dimension_filter=FilterExpression(
+            and_group=FilterExpressionList(expressions=[
+                FilterExpression(filter=Filter(field_name="pagePath", string_filter=Filter.StringFilter(value=path))),
+                FilterExpression(filter=Filter(field_name="eventName", string_filter=Filter.StringFilter(value="click"))),
+            ])
+        ),
+    )
+    resp = ga4_client.run_report(req)
+    return {row.dimension_values[0].value: int(row.metric_values[0].value) for row in resp.rows}
+
+
 def get_ga4_stats(ga4_client, url):
     path = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
     end = date.today() - timedelta(days=1)
@@ -445,6 +483,14 @@ def main():
                 ga4["connect_pageviews"] = get_connect_pageviews(ga4_client, listing["url"])
             else:
                 ga4["connect_pageviews"] = None  # not yet confirmed whether listing pages have their own /connect path
+            if TRACK_OUTBOUND_CLICKS:
+                try:
+                    ga4["outbound_clicks_by_domain"] = get_outbound_click_stats(ga4_client, listing["url"])
+                except Exception as e:
+                    ga4["outbound_clicks_by_domain"] = None  # "Link Domain" custom dimension likely not registered yet
+                    print(f"  outbound click breakdown unavailable ({e}) — register the Link Domain custom dimension in GA4 Admin")
+            else:
+                ga4["outbound_clicks_by_domain"] = None
             flag = triage(gsc, ga4)
             results.append({**listing, "gsc": gsc, "ga4": ga4, "triage_flag": flag})
         except Exception as e:
