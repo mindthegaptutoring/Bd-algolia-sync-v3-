@@ -1,6 +1,14 @@
 """
 LWEA Listing Stats Sync
 ========================
+Version: 1.1.0
+  1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
+          triage flags, GitHub-published results.json
+  1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
+          event (was a guessed placeholder); added connect_pageviews for BD's
+          native "Send Message" flow (tracked as a /connect pageview, not a
+          click event); switched Google auth from an env-var JSON string to a
+          Render Secret File
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as a single JSON file that both
 the educator-facing dashboard widget and Kristen's admin triage widget can
@@ -65,7 +73,8 @@ GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "listing-stats/results.jso
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
 LOOKBACK_DAYS = 28
-CONTACT_EVENT_NAME = "get_matched_click"  # CONFIRM this against real GA4 events; None if not instrumented yet
+CONTACT_EVENT_NAME = "mailto_click"  # confirmed live sitewide — fires on any a[href^="mailto:"] click, anywhere on the page
+TRACK_CONNECT_PAGEVIEWS = True  # BD's native "Send Message" button has no click event, just navigates to <profile_url>/connect — pull as a pageview instead
 
 # ---------------------------------------------------------------------------
 # TRIAGE THRESHOLDS — change these freely, logic below doesn't need to change
@@ -280,6 +289,31 @@ def get_gsc_stats(gsc_service, url):
 # ---------------------------------------------------------------------------
 # 4. GA4: sessions, engagement, traffic source, contact-click event
 # ---------------------------------------------------------------------------
+def get_connect_pageviews(ga4_client, profile_url):
+    """
+    BD's native 'Send Message' button has no click event — it just navigates to
+    <profile_url>/connect. Pull that page's own pageview count as the proxy for
+    'someone used the native BD contact flow'. Only meaningful for profile-type
+    URLs (unconfirmed whether individual Classes & Resources listings have their
+    own /connect sub-path or route through the profile's — verify before trusting
+    this for post_type == "listing").
+    """
+    path = "/" + profile_url.split("/", 3)[-1].rstrip("/") + "/connect"
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=LOOKBACK_DAYS)
+    req = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        dimensions=[Dimension(name="pagePath")],
+        metrics=[Metric(name="screenPageViews")],
+        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+        dimension_filter=FilterExpression(
+            filter=Filter(field_name="pagePath", string_filter=Filter.StringFilter(value=path))
+        ),
+    )
+    resp = ga4_client.run_report(req)
+    return int(resp.rows[0].metric_values[0].value) if resp.rows else 0
+
+
 def get_ga4_stats(ga4_client, url):
     path = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
     end = date.today() - timedelta(days=1)
@@ -407,6 +441,10 @@ def main():
         try:
             gsc = get_gsc_stats(gsc_service, listing["url"])
             ga4 = get_ga4_stats(ga4_client, listing["url"])
+            if TRACK_CONNECT_PAGEVIEWS and listing["post_type"] == "profile":
+                ga4["connect_pageviews"] = get_connect_pageviews(ga4_client, listing["url"])
+            else:
+                ga4["connect_pageviews"] = None  # not yet confirmed whether listing pages have their own /connect path
             flag = triage(gsc, ga4)
             results.append({**listing, "gsc": gsc, "ga4": ga4, "triage_flag": flag})
         except Exception as e:
