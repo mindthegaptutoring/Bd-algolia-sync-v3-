@@ -55,7 +55,7 @@ LISTING_STATUS = "1"    # published
 ACTIVE_USER = "2"       # active member
 MAX_USER_ID = 300       # same probe ceiling as bd_algolia_sync_v3.py — raise BOTH scripts together if membership grows past this
 
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]  # full JSON key, as a string
+GOOGLE_CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "/etc/secrets/google-credentials.json")
 GSC_SITE_URL = os.environ.get("GSC_SITE_URL", "https://www.learnwitheveryavenue.com/")
 GA4_PROPERTY_ID = os.environ["GA4_PROPERTY_ID"]  # numeric string, e.g. "123456789"
 
@@ -228,9 +228,8 @@ def get_bd_listings() -> list:
 # 2. Google auth (shared by GSC + GA4)
 # ---------------------------------------------------------------------------
 def get_google_credentials():
-    info = json.loads(GOOGLE_CREDS_JSON)
-    return service_account.Credentials.from_service_account_info(
-        info,
+    return service_account.Credentials.from_service_account_file(
+        GOOGLE_CREDENTIALS_PATH,
         scopes=[
             "https://www.googleapis.com/auth/webmasters.readonly",
             "https://www.googleapis.com/auth/analytics.readonly",
