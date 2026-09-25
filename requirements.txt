@@ -1,2 +1,5 @@
 algoliasearch>=3.0.0,<4.0.0
 requests
+google-auth>=2.29.0
+google-api-python-client>=2.126.0
+google-analytics-data>=0.18.0
