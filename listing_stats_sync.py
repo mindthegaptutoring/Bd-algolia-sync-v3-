@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.4.0
+Version: 1.4.1
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -38,6 +38,19 @@ Version: 1.4.0
           backfill_history.py once to seed up to ~12 months of real history
           from GSC + GA4's own retained data, rather than waiting a year for
           the chart to have anything to show.
+  1.4.1 — fixed a real unit mismatch caught during testing: make_history_point
+          was reading from the same gsc/ga4 values as the snapshot table —
+          28-day rolling totals — and writing them into history.json as if
+          they were single-week figures. backfill_history.py's points are
+          true 7-day totals. Mixing the two in one trend array would have
+          made every point silently ~4x too high the moment live data picked
+          up from backfilled data, a fake jump right at the seam with no
+          error or warning. get_gsc_stats and get_ga4_stats now take an
+          optional `days` argument; main() does a second, 7-day-only pull
+          per listing (include_queries=False on the GSC side, since history
+          doesn't need top_queries) specifically for history.json, leaving
+          the 28-day snapshot pull and results.json's schema untouched. Adds
+          two GSC/GA4 calls per listing to the regular weekly run.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -286,9 +299,9 @@ def get_google_credentials():
 # ---------------------------------------------------------------------------
 # 3. Search Console: totals + top queries per URL
 # ---------------------------------------------------------------------------
-def get_gsc_stats(gsc_service, url):
+def get_gsc_stats(gsc_service, url, days=LOOKBACK_DAYS, include_queries=True):
     end = date.today() - timedelta(days=3)   # GSC data lags ~2-3 days
-    start = end - timedelta(days=LOOKBACK_DAYS)
+    start = end - timedelta(days=days)
 
     base_body = {
         "startDate": start.isoformat(),
@@ -310,15 +323,16 @@ def get_gsc_stats(gsc_service, url):
         "position": round(row.get("position", 0.0), 1),
     }
 
-    # Top 5 queries
-    query_body = dict(base_body, dimensions=["query"], rowLimit=5)
-    queries_resp = gsc_service.searchanalytics().query(
-        siteUrl=GSC_SITE_URL, body=query_body
-    ).execute()
-    top_queries = [
-        {"query": r["keys"][0], "clicks": r["clicks"], "impressions": r["impressions"]}
-        for r in queries_resp.get("rows", [])
-    ]
+    top_queries = []
+    if include_queries:
+        query_body = dict(base_body, dimensions=["query"], rowLimit=5)
+        queries_resp = gsc_service.searchanalytics().query(
+            siteUrl=GSC_SITE_URL, body=query_body
+        ).execute()
+        top_queries = [
+            {"query": r["keys"][0], "clicks": r["clicks"], "impressions": r["impressions"]}
+            for r in queries_resp.get("rows", [])
+        ]
 
     return {**totals, "top_queries": top_queries}
 
@@ -384,10 +398,10 @@ def get_outbound_click_stats(ga4_client, url):
     return {row.dimension_values[0].value: int(row.metric_values[0].value) for row in resp.rows}
 
 
-def get_ga4_stats(ga4_client, url):
+def get_ga4_stats(ga4_client, url, days=LOOKBACK_DAYS):
     path = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
     end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=LOOKBACK_DAYS)
+    start = end - timedelta(days=days)
     date_range = DateRange(start_date=start.isoformat(), end_date=end.isoformat())
     page_filter = FilterExpression(
         filter=Filter(field_name="pagePath", string_filter=Filter.StringFilter(value=path))
@@ -513,9 +527,17 @@ def triage(gsc, ga4, t):
 def make_history_point(r):
     """One compact weekly snapshot for the trend chart. Deliberately lean —
     only what a trend line actually needs, not the full result row (no
-    top_queries, no traffic_sources breakdown — those stay snapshot-only)."""
-    gsc = r.get("gsc", {})
-    ga4 = r.get("ga4", {})
+    top_queries, no traffic_sources breakdown — those stay snapshot-only).
+
+    IMPORTANT: reads from r["_gsc_week"] / r["_ga4_week"] — a separate
+    7-day-only pull done alongside the normal 28-day snapshot pull (see
+    main()), NOT from r["gsc"] / r["ga4"], which are 28-day rolling totals.
+    Mixing a 28-day total into the same trend array as backfill_history.py's
+    true 7-day weekly buckets would make every point look ~4x too high
+    right where live data picks up from backfilled data — same number,
+    different unit, silently wrong."""
+    gsc = r.get("_gsc_week", {})
+    ga4 = r.get("_ga4_week", {})
     return {
         "date": date.today().isoformat(),
         "impressions": gsc.get("impressions", 0),
@@ -628,7 +650,15 @@ def main():
                     print(f"  outbound click breakdown unavailable ({e}) — register the Link Domain custom dimension in GA4 Admin")
             else:
                 ga4["outbound_clicks_by_domain"] = None
-            results.append({**listing, "gsc": gsc, "ga4": ga4})
+
+            # Separate 7-day-only pull, for history.json ONLY — see
+            # make_history_point's docstring for why this can't reuse the
+            # 28-day gsc/ga4 above. include_queries=False since history
+            # doesn't need top_queries, saving one GSC call per listing.
+            gsc_week = get_gsc_stats(gsc_service, listing["url"], days=7, include_queries=False)
+            ga4_week = get_ga4_stats(ga4_client, listing["url"], days=7)
+
+            results.append({**listing, "gsc": gsc, "ga4": ga4, "_gsc_week": gsc_week, "_ga4_week": ga4_week})
         except Exception as e:
             # One bad URL shouldn't kill the whole run
             results.append({**listing, "error": str(e)})
@@ -642,9 +672,21 @@ def main():
         else:
             r["triage_flag"] = "error"
 
+    # Build history.json's data from the full result rows (still carrying
+    # _gsc_week/_ga4_week) BEFORE those internal-only fields get stripped
+    # below for the public results.json payload.
+    existing_history, _ = fetch_existing_json(GITHUB_HISTORY_FILE_PATH)
+    existing_history_index = (existing_history or {}).get("history", {})
+    new_history_index = build_updated_history(results, existing_history_index)
+
     # results.json — UNCHANGED shape from 1.3.0. Existing widgets (Widget 53's
     # snapshot table, Widget 54's admin triage table) need no changes and
-    # carry zero risk from this release.
+    # carry zero risk from this release. Strip the internal history-only
+    # fields so this promise actually holds — they were never part of this
+    # file's schema.
+    for r in results:
+        r.pop("_gsc_week", None)
+        r.pop("_ga4_week", None)
     payload = {
         "generated_at": date.today().isoformat(),
         "lookback_days": LOOKBACK_DAYS,
@@ -655,9 +697,6 @@ def main():
 
     # history.json — NEW in 1.4.0. Separate file so results.json (and every
     # existing widget reading it) stays exactly as fast and small as before.
-    existing_history, _ = fetch_existing_json(GITHUB_HISTORY_FILE_PATH)
-    existing_history_index = (existing_history or {}).get("history", {})
-    new_history_index = build_updated_history(results, existing_history_index)
     history_payload = {
         "generated_at": date.today().isoformat(),
         "lookback_days": LOOKBACK_DAYS,
