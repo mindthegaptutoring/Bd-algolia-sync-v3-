@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.3.0
+Version: 1.4.0
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -22,11 +22,27 @@ Version: 1.3.0
           performance. main() is now two passes: collect all data, then
           compute + apply thresholds, so the cutoffs reflect this run's real
           distribution instead of a guess.
+  1.4.0 — added trending. results.json is UNCHANGED — same shape as before,
+          so Widget 53's existing snapshot table and Widget 54's admin triage
+          table need zero changes and carry zero risk from this update. A
+          NEW, separate file (history.json) is published alongside it: a
+          dict of {listing_url: [weekly_snapshot, ...]}, one entry appended
+          each week, capped at HISTORY_MAX_WEEKS (52 = ~1 year). Kept as a
+          separate file on purpose — bundling 52 weeks of history into every
+          listing inside results.json would roughly 10x that file's size and
+          make every dashboard load (which only ever needs the CURRENT
+          snapshot) pay for history nobody's viewing yet. Only the new trend
+          chart in Widget 53 needs to fetch history.json, and only when it's
+          actually rendering a chart.
+          Before this file has any real weekly data in it, run
+          backfill_history.py once to seed up to ~12 months of real history
+          from GSC + GA4's own retained data, rather than waiting a year for
+          the chart to have anything to show.
 Pulls per-listing search + engagement data from Google Search Console and
-GA4, keyed by BD member_id, and publishes it as a single JSON file that both
-the educator-facing dashboard widget and Kristen's admin triage widget can
-fetch client-side (same "static JSON served from GitHub Pages" pattern
-already used by lwea-search, just a second file instead of a second repo).
+GA4, keyed by BD member_id, and publishes it as JSON files that both the
+educator-facing dashboard widget and Kristen's admin triage widget can fetch
+client-side (same "static JSON served from GitHub Pages" pattern already
+used by lwea-search, just additional files instead of a second repo).
 
 Designed to run on Render on the same weekly cron-job.org schedule as
 bd_algolia_sync_v3.py.
@@ -83,9 +99,11 @@ GA4_PROPERTY_ID = os.environ["GA4_PROPERTY_ID"]  # numeric string, e.g. "1234567
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "mindthegaptutoring/lwea-search")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "listing-stats/results.json")
+GITHUB_HISTORY_FILE_PATH = os.environ.get("GITHUB_HISTORY_FILE_PATH", "listing-stats/history.json")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
 LOOKBACK_DAYS = 28
+HISTORY_MAX_WEEKS = 52  # rolling ~1 year of weekly snapshots per listing before oldest points age out
 CONTACT_EVENT_NAME = "mailto_click"  # confirmed live sitewide — fires on any a[href^="mailto:"] click, anywhere on the page
 TRACK_CONNECT_PAGEVIEWS = True  # BD's native "Send Message" button has no click event, just navigates to <profile_url>/connect — pull as a pageview instead
 TRACK_OUTBOUND_CLICKS = True  # requires the "Link Domain" custom dimension registered in GA4 Admin (see SETUP_GUIDE.md) — safe to leave True even before that's done, the call just fails gracefully per-listing until then
@@ -490,10 +508,77 @@ def triage(gsc, ga4, t):
 
 
 # ---------------------------------------------------------------------------
-# 6. Publish results.json to GitHub (same static-hosting pattern as lwea-search)
+# 6. History (trending) — NEW in 1.4.0
 # ---------------------------------------------------------------------------
-def publish_to_github(payload):
-    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+def make_history_point(r):
+    """One compact weekly snapshot for the trend chart. Deliberately lean —
+    only what a trend line actually needs, not the full result row (no
+    top_queries, no traffic_sources breakdown — those stay snapshot-only)."""
+    gsc = r.get("gsc", {})
+    ga4 = r.get("ga4", {})
+    return {
+        "date": date.today().isoformat(),
+        "impressions": gsc.get("impressions", 0),
+        "clicks": gsc.get("clicks", 0),
+        "ctr": gsc.get("ctr", 0.0),
+        "position": gsc.get("position", 0.0),
+        "sessions": ga4.get("sessions", 0),
+        "avg_engagement_seconds": ga4.get("avg_engagement_seconds", 0.0),
+        "contact_clicks": ga4.get("contact_clicks"),
+        "connect_pageviews": ga4.get("connect_pageviews"),
+        "triage_flag": r.get("triage_flag", "error"),
+    }
+
+
+def build_updated_history(results, existing_history_index):
+    """
+    existing_history_index: {url: [weekly_point, ...]} from the last published
+    history.json (empty dict if this is the first run with trending, or the
+    file didn't exist / failed to parse).
+    Returns the new full index, one point appended per listing this run,
+    each list capped at HISTORY_MAX_WEEKS.
+    """
+    new_index = {}
+    for r in results:
+        url = r.get("url")
+        if not url:
+            continue
+        prior = list(existing_history_index.get(url, []))
+        if "gsc" in r and "ga4" in r:
+            prior.append(make_history_point(r))
+        new_index[url] = prior[-HISTORY_MAX_WEEKS:]
+    return new_index
+
+
+# ---------------------------------------------------------------------------
+# 7. GitHub read/publish — generalized in 1.4.0 to take a file_path, since
+#    two files are now published each run instead of one
+# ---------------------------------------------------------------------------
+def fetch_existing_json(file_path):
+    """
+    GET the currently-published JSON at file_path (content + sha), so a run
+    can build on top of it instead of starting fresh. Returns
+    (parsed_json_or_None, sha_or_None). A missing file, a network hiccup, or
+    unparseable content all just fall back to None — callers treat that as
+    "start from scratch", never as a fatal error.
+    """
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH})
+    if resp.status_code != 200:
+        return None, None
+    data = resp.json()
+    sha = data.get("sha")
+    try:
+        content = base64.b64decode(data["content"]).decode("utf-8")
+        return json.loads(content), sha
+    except Exception as e:
+        print(f"  Could not parse existing {file_path} ({e}) — starting fresh.")
+        return None, sha
+
+
+def publish_to_github(payload, file_path):
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
 
     # Need the current file's sha to update it (GitHub Contents API requirement)
@@ -502,7 +587,7 @@ def publish_to_github(payload):
 
     content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
     body = {
-        "message": f"Update listing stats — {date.today().isoformat()}",
+        "message": f"Update {file_path} — {date.today().isoformat()}",
         "content": content_b64,
         "branch": GITHUB_BRANCH,
     }
@@ -557,14 +642,31 @@ def main():
         else:
             r["triage_flag"] = "error"
 
+    # results.json — UNCHANGED shape from 1.3.0. Existing widgets (Widget 53's
+    # snapshot table, Widget 54's admin triage table) need no changes and
+    # carry zero risk from this release.
     payload = {
         "generated_at": date.today().isoformat(),
         "lookback_days": LOOKBACK_DAYS,
         "triage_thresholds": thresholds,  # published for transparency — the exact cutoffs this run used, by post_type
         "listings": results,
     }
-    publish_to_github(payload)
-    print(f"Synced {len(results)} listings.")
+    publish_to_github(payload, GITHUB_FILE_PATH)
+
+    # history.json — NEW in 1.4.0. Separate file so results.json (and every
+    # existing widget reading it) stays exactly as fast and small as before.
+    existing_history, _ = fetch_existing_json(GITHUB_HISTORY_FILE_PATH)
+    existing_history_index = (existing_history or {}).get("history", {})
+    new_history_index = build_updated_history(results, existing_history_index)
+    history_payload = {
+        "generated_at": date.today().isoformat(),
+        "lookback_days": LOOKBACK_DAYS,
+        "history_max_weeks": HISTORY_MAX_WEEKS,
+        "history": new_history_index,  # {listing_url: [weekly_point, ...]}
+    }
+    publish_to_github(history_payload, GITHUB_HISTORY_FILE_PATH)
+
+    print(f"Synced {len(results)} listings. History now covers up to {HISTORY_MAX_WEEKS} weeks per listing.")
 
 
 if __name__ == "__main__":
