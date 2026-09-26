@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.4.1
+Version: 1.5.0
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -51,6 +51,22 @@ Version: 1.4.1
           doesn't need top_queries) specifically for history.json, leaving
           the 28-day snapshot pull and results.json's schema untouched. Adds
           two GSC/GA4 calls per listing to the regular weekly run.
+  1.5.0 — added `posted_date` to every listing in results.json (profiles:
+          signup date; Classes & Resources listings: cover-photo upload date
+          as the closest available creation-date proxy — this API surface
+          has no clean "created" column). Purely additive to results.json's
+          schema, existing widgets ignore the new field. Lets the dashboard
+          mark each listing's actual creation date on its trend sparkline
+          instead of implying the chart's start date IS the creation date,
+          which isn't always true (GSC/GA4 indexing lag can mean the first
+          real data point comes after the listing already existed).
+          UNVERIFIED: the exact field this script's own API auth context
+          returns for a listing's cover-photo date hasn't been confirmed —
+          only confirmed against a separate admin-tooling response shape.
+          Check results.json after the first run post-deploy; if
+          posted_date is null for every listing row, the field path in
+          _extract_posted_date_iso() needs adjusting to whatever this
+          endpoint actually returns.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -174,6 +190,34 @@ def bd_get(endpoint: str, params: dict = None) -> dict:
     return bd_request("GET", endpoint, params=params)
 
 
+def _extract_posted_date_iso(listing: dict):
+    """
+    Best-effort creation-date proxy for a Classes & Resources listing.
+    users_portfolio_groups has no clean "created" column on this API surface
+    (confirmed against the admin tooling's response shape — group_date is
+    always null). The closest real proxy is the cover photo's date_added,
+    since photos are normally uploaded at listing-creation time. Tries a
+    couple of plausible field shapes defensively; returns None (not a guess)
+    if none are present, since this API endpoint's exact shape for this
+    field hasn't been confirmed yet from the sync script's own auth context
+    — verify after first deploy that this is actually populating, and adjust
+    the field path here if BD returns something different than expected.
+    """
+    portfolio = listing.get("users_portfolio") or {}
+    if isinstance(portfolio, list) and portfolio:
+        portfolio = portfolio[0]
+    raw = portfolio.get("photo_date_added") if isinstance(portfolio, dict) else None
+    if not raw:
+        raw = listing.get("group_date") or listing.get("date_created")
+    if not raw or len(str(raw)) < 8:
+        return None
+    raw = str(raw)
+    try:
+        return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+    except Exception:
+        return None
+
+
 def get_all_active_users() -> list:
     """Probe user_id 1..MAX_USER_ID, same consecutive-miss stop logic as
     bd_algolia_sync_v3.py (BD has no bulk user list, so this is the only way in)."""
@@ -260,6 +304,7 @@ def get_bd_listings() -> list:
                 "url": f"{BD_BASE}/{filename}",
                 "title": name,
                 "post_type": "profile",
+                "posted_date": (user.get("signup_date") or "")[:10] or None,  # BD returns ISO datetime, take just the date part
             })
 
         print(f"  [{i}/{len(users)}] {name} (user_id={uid}) — fetching listings")
@@ -274,6 +319,7 @@ def get_bd_listings() -> list:
                     "url": f"{BD_BASE}/{group_filename}",
                     "title": (listing.get("group_name") or "").strip(),
                     "post_type": "listing",
+                    "posted_date": _extract_posted_date_iso(listing),
                 })
         except Exception as e:
             print(f"  listings error for user_id={uid}: {e}")
