@@ -1,0 +1,45 @@
+name: Backfill Listing Stats History (one-time)
+
+# Manual trigger only — this is a one-time script, not a recurring job.
+# Go to the Actions tab → this workflow → "Run workflow" button.
+on:
+  workflow_dispatch:
+    inputs:
+      backfill_weeks:
+        description: 'How many weeks back to backfill (default 52 = ~1 year)'
+        required: false
+        default: '52'
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google service account credentials
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: echo "$GOOGLE_CREDENTIALS_JSON" > google-credentials.json
+
+      - name: Run backfill
+        env:
+          BD_API_KEY: ${{ secrets.BD_API_KEY }}
+          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
+          GSC_SITE_URL: https://www.learnwitheveryavenue.com/
+          GOOGLE_CREDENTIALS_PATH: google-credentials.json
+          # Same fine-grained PAT already used on Render — needs write access
+          # to mindthegaptutoring/lwea-search specifically, since that's the
+          # repo history.json actually gets published to, not this one.
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_LWEA_SEARCH }}
+          GITHUB_REPO: mindthegaptutoring/lwea-search
+          BACKFILL_WEEKS: ${{ github.event.inputs.backfill_weeks }}
+        run: python backfill_history.py
