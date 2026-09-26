@@ -26,11 +26,16 @@ GA4 call per listing, each returning daily-granularity rows for the whole
 backfill window, then buckets those days into ISO weeks in Python. Same
 order of magnitude of API calls as one regular weekly sync run, not 52x it.
 
-SAFE TO RE-RUN: only fills in weeks that don't already exist in history.json
-for a given listing. Never overwrites a week that's already there (whether
-from a prior backfill run or from the regular weekly sync), so re-running
-this after the trending feature has been live for a while just tops up any
-listing that's new since the last backfill, without disturbing real data.
+SAFE TO RE-RUN: only fills in weeks older than ~2 weeks ago if they don't
+already exist in history.json for a given listing — those are left alone.
+The most recent ~2 weeks are always recomputed fresh from GSC/GA4 on every
+run, rather than trusted as-is, since the newest week is the one most likely
+to have been affected by GSC's own reporting lag when it was last written.
+This is also what self-heals the specific issue fixed in this version: an
+earlier version of this script could publish a trailing week that only had
+partial data in it (see "week_start / backfill_gsc_by_week" below), which
+made the newest point misleadingly look like a drop compared to the
+complete weeks before it. Re-running this version corrects that automatically.
 
 Usage:
     BACKFILL_WEEKS=52 python backfill_history.py
@@ -64,6 +69,11 @@ def backfill_gsc_by_week(gsc_service, url, start: date, end: date) -> dict:
     """
     ONE GSC call for the whole window, dimensioned by date, then bucketed
     into weeks here. Returns {week_start_iso: {"impressions", "clicks", "ctr", "position"}}.
+    Drops a trailing bucket that doesn't have a full 7 days of data within
+    [start, end] — GSC's ~3-day reporting lag means the most recent ISO week
+    is almost always only partially covered, and publishing that partial
+    week as if it were a full one makes it look like an artificial drop
+    compared to the complete weeks before it.
     """
     body = {
         "startDate": start.isoformat(),
@@ -79,7 +89,7 @@ def backfill_gsc_by_week(gsc_service, url, start: date, end: date) -> dict:
     buckets = defaultdict(lambda: {"impressions": 0, "clicks": 0, "position_weighted_sum": 0.0})
     for row in resp.get("rows", []):
         day = date.fromisoformat(row["keys"][0])
-        wk = week_start(day).isoformat()
+        wk = week_start(day)
         impressions = row.get("impressions", 0)
         buckets[wk]["impressions"] += impressions
         buckets[wk]["clicks"] += row.get("clicks", 0)
@@ -87,8 +97,10 @@ def backfill_gsc_by_week(gsc_service, url, start: date, end: date) -> dict:
 
     result = {}
     for wk, b in buckets.items():
+        if wk + timedelta(days=6) > end:
+            continue  # partial week — see docstring
         impressions = b["impressions"]
-        result[wk] = {
+        result[wk.isoformat()] = {
             "impressions": impressions,
             "clicks": b["clicks"],
             "ctr": round(b["clicks"] / impressions, 4) if impressions else 0.0,
@@ -102,6 +114,8 @@ def backfill_ga4_by_week(ga4_client, url, start: date, end: date) -> dict:
     ONE GA4 call for the whole window, dimensioned by pagePath + date, then
     bucketed into weeks here. Returns
     {week_start_iso: {"sessions", "avg_engagement_seconds"}}.
+    Same trailing-partial-week drop as backfill_gsc_by_week, for the same
+    reason — keeps the two metrics' week boundaries aligned too.
     """
     path = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
     req = RunReportRequest(
@@ -120,14 +134,16 @@ def backfill_ga4_by_week(ga4_client, url, start: date, end: date) -> dict:
         # GA4's "date" dimension comes back as YYYYMMDD, not ISO — parse accordingly
         day_str = row.dimension_values[1].value
         day = date(int(day_str[0:4]), int(day_str[4:6]), int(day_str[6:8]))
-        wk = week_start(day).isoformat()
+        wk = week_start(day)
         buckets[wk]["sessions"] += int(row.metric_values[0].value)
         buckets[wk]["engagement_secs"] += float(row.metric_values[1].value)
 
     result = {}
     for wk, b in buckets.items():
+        if wk + timedelta(days=6) > end:
+            continue  # partial week — see docstring
         sessions = b["sessions"]
-        result[wk] = {
+        result[wk.isoformat()] = {
             "sessions": sessions,
             "avg_engagement_seconds": round(b["engagement_secs"] / sessions, 1) if sessions else 0.0,
         }
@@ -163,12 +179,21 @@ def main():
             print(f"    GA4 backfill failed for {url}: {e}")
             ga4_weeks = {}
 
-        existing_weeks = {pt["date"] for pt in history_index.get(url, [])}
+        # Drop and recompute the last ~2 weeks of whatever's already stored for
+        # this listing, rather than treating existing data as fixed. This is
+        # what self-heals the partial-week contamination from a prior run
+        # (before this fix existed) without needing to track per-point
+        # metadata about which weeks were complete when they were written —
+        # it just always re-verifies the most recent stretch against fresh
+        # data every time backfill runs.
+        cutoff = (week_start(end) - timedelta(days=7)).isoformat()
+        trusted_prior = [pt for pt in history_index.get(url, []) if pt["date"] < cutoff]
+        existing_weeks = {pt["date"] for pt in trusted_prior}
         all_week_keys = sorted(set(gsc_weeks) | set(ga4_weeks))
         new_points = []
         for wk in all_week_keys:
             if wk in existing_weeks:
-                continue  # never overwrite a week that's already there — see module docstring
+                continue  # already trusted and outside the recompute window
             g = gsc_weeks.get(wk, {"impressions": 0, "clicks": 0, "ctr": 0.0, "position": 0.0})
             a = ga4_weeks.get(wk, {"sessions": 0, "avg_engagement_seconds": 0.0})
             new_points.append({
@@ -185,7 +210,7 @@ def main():
             })
 
         merged = sorted(
-            history_index.get(url, []) + new_points,
+            trusted_prior + new_points,
             key=lambda pt: pt["date"],
         )[-HISTORY_MAX_WEEKS:]
         history_index[url] = merged
