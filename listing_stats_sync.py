@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.2
+Version: 1.5.3
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -108,6 +108,25 @@ Version: 1.5.2
           breakage, it's a bug that's been there the whole time and only
           surfaced now because we happened to cross-check one listing's
           numbers against GA4's own UI directly.
+  1.5.3 — fixed history.json duplicating a week's data point instead of
+          replacing it when the sync gets run more than once in the same
+          week (e.g. a manual re-run to verify a fix — exactly what
+          surfaced this, on 2026-09-28). make_history_point() used to
+          stamp every point with date.today(), and build_updated_history()
+          always appended, with no check for an existing point that same
+          week. Since each point is a rolling 7-day window, two points
+          close together in a re-run scenario overlap heavily in which
+          real days they cover — visually and numerically double-counting
+          substantially the same week rather than showing two genuinely
+          separate weeks. Both functions now key on week_start() (the
+          Monday of the current week, not the exact run date) and
+          build_updated_history replaces any existing point for that week
+          instead of appending a second one. week_start() itself moved
+          here from backfill_history.py, which now imports it from this
+          file instead of keeping its own copy — two copies of "what
+          counts as the same week" was exactly the kind of thing that
+          could quietly drift apart between the two scripts, so there's
+          now one definition both share.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -636,6 +655,18 @@ def triage(gsc, ga4, t):
 # ---------------------------------------------------------------------------
 # 6. History (trending) — NEW in 1.4.0
 # ---------------------------------------------------------------------------
+def week_start(d: date) -> date:
+    """
+    Monday of the ISO week containing d — the single bucket key used
+    everywhere in the history system (this file's make_history_point,
+    and backfill_history.py, which imports this instead of keeping its
+    own copy). Consistent week alignment between the regular sync and
+    backfill is what lets build_updated_history below de-duplicate
+    correctly regardless of which script last touched a given week.
+    """
+    return d - timedelta(days=d.weekday())
+
+
 def make_history_point(r):
     """One compact weekly snapshot for the trend chart. Deliberately lean —
     only what a trend line actually needs, not the full result row (no
@@ -647,11 +678,14 @@ def make_history_point(r):
     Mixing a 28-day total into the same trend array as backfill_history.py's
     true 7-day weekly buckets would make every point look ~4x too high
     right where live data picks up from backfilled data — same number,
-    different unit, silently wrong."""
+    different unit, silently wrong.
+
+    "date" is the Monday of the current week, not date.today() — see
+    build_updated_history's docstring for why that distinction matters."""
     gsc = r.get("_gsc_week", {})
     ga4 = r.get("_ga4_week", {})
     return {
-        "date": date.today().isoformat(),
+        "date": week_start(date.today()).isoformat(),
         "impressions": gsc.get("impressions", 0),
         "clicks": gsc.get("clicks", 0),
         "ctr": gsc.get("ctr", 0.0),
@@ -669,8 +703,22 @@ def build_updated_history(results, existing_history_index):
     existing_history_index: {url: [weekly_point, ...]} from the last published
     history.json (empty dict if this is the first run with trending, or the
     file didn't exist / failed to parse).
-    Returns the new full index, one point appended per listing this run,
-    each list capped at HISTORY_MAX_WEEKS.
+    Returns the new full index, one point per listing per week, each list
+    capped at HISTORY_MAX_WEEKS.
+
+    FIXED: this used to always append a new point stamped with
+    date.today(), with no check for whether a point already existed for
+    the current week. Running the sync more than once in the same week —
+    exactly what happened when it was manually re-run to verify a fix —
+    appended a second, nearly-identical point instead of replacing the
+    first one. Since each point is itself a rolling 7-day window, two
+    points close together overlap heavily in which real days they're
+    counting, so the chart visually showed what looked like separate
+    activity that was substantially the same week counted twice. Now
+    replaces any existing point for the same week (by the date key
+    make_history_point produces — the Monday of the current week) instead
+    of appending, so re-running the sync any number of times in the same
+    week is safe and just keeps that week's point fresh, never duplicates it.
     """
     new_index = {}
     for r in results:
@@ -679,9 +727,12 @@ def build_updated_history(results, existing_history_index):
             continue
         prior = list(existing_history_index.get(url, []))
         if "gsc" in r and "ga4" in r:
-            prior.append(make_history_point(r))
+            point = make_history_point(r)
+            prior = [p for p in prior if p.get("date") != point["date"]]
+            prior.append(point)
         new_index[url] = prior[-HISTORY_MAX_WEEKS:]
     return new_index
+
 
 
 # ---------------------------------------------------------------------------
