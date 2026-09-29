@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.1
+Version: 1.5.2
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -84,6 +84,30 @@ Version: 1.5.1
           current content but git itself keeps prior versions unless
           history was force-pushed or squashed. Worth checking before
           concluding it's gone for good.
+  1.5.2 — fixed a real GA4-side data loss bug for any listing whose URL
+          slug contains a percent-encoded non-ASCII character (e.g. an
+          en-dash, "grades-3–12" stored as the literal text
+          "%E2%80%9312" in BD's group_filename). Every GA4 query in this
+          script built its pagePath filter directly from that still-
+          encoded stored URL, but browsers decode the URL before
+          reporting document.location.pathname to GA4 — so GA4's real
+          pagePath contains the actual "–" character, never the encoded
+          text, and the exact-match filter silently matched nothing.
+          Confirmed live: a listing with a verified real mailto_click
+          event in GA4's own UI showed zero for every GA4 field —
+          sessions, engagement, contact_clicks, outbound clicks, all of
+          it, not just the one metric that surfaced this. Added a shared
+          bd_url_to_ga4_path() helper (unquote() the path before use) and
+          applied it everywhere a GA4 pagePath filter is built, including
+          backfill_history.py's own copy of this logic. Does not affect
+          GSC's queries — those use the full URL against Search Console's
+          own "page" dimension, a different matching mechanism, unrelated
+          to this bug. Any currently-published listing with a non-ASCII
+          slug character has been under-reporting GA4 data (possibly to
+          zero) since this script's very first version — this isn't new
+          breakage, it's a bug that's been there the whole time and only
+          surfaced now because we happened to cross-check one listing's
+          numbers against GA4's own UI directly.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -114,6 +138,7 @@ import random
 import base64
 import requests
 from datetime import date, timedelta
+from urllib.parse import unquote
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
@@ -403,6 +428,30 @@ def get_gsc_stats(gsc_service, url, days=LOOKBACK_DAYS, include_queries=True):
 # ---------------------------------------------------------------------------
 # 4. GA4: sessions, engagement, traffic source, contact-click event
 # ---------------------------------------------------------------------------
+def bd_url_to_ga4_path(url: str) -> str:
+    """
+    Converts a full BD URL (or an already-relative path) into the path
+    GA4's `pagePath` dimension will actually contain.
+
+    IMPORTANT: BD's group_filename (and therefore every listing's stored
+    `url`) comes back percent-encoded for any non-ASCII character — e.g. an
+    en-dash in a slug like "grades-3–12" is stored as the literal text
+    "%E2%80%9312". Browsers decode that automatically when reporting
+    document.location.pathname to GA4, so GA4's real pagePath value
+    contains the actual "–" character, not the percent-encoded text. A
+    filter built from the raw, still-encoded url therefore does an exact
+    string match against something that never actually appears in GA4's
+    data — silently zero rows, not an error. Confirmed live: an en-dash
+    listing (Zee Roda's "Online Math Tutor... Grades 3–12") had real,
+    verified mailto_click events in GA4's own UI that this script reported
+    as zero, and its entire GA4 block (sessions, engagement, everything)
+    was zero for the same reason, not just contact clicks. unquote()
+    fixes this for every GA4 query in this script, not just one.
+    """
+    raw = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
+    return unquote(raw)
+
+
 def get_connect_pageviews(ga4_client, profile_url):
     """
     BD's native 'Send Message' button has no click event — it just navigates to
@@ -412,7 +461,7 @@ def get_connect_pageviews(ga4_client, profile_url):
     own /connect sub-path or route through the profile's — verify before trusting
     this for post_type == "listing").
     """
-    path = "/" + profile_url.split("/", 3)[-1].rstrip("/") + "/connect"
+    path = bd_url_to_ga4_path(profile_url).rstrip("/") + "/connect"
     end = date.today() - timedelta(days=1)
     start = end - timedelta(days=LOOKBACK_DAYS)
     req = RunReportRequest(
@@ -442,7 +491,7 @@ def get_outbound_click_stats(ga4_client, url):
     name outright; the caller catches that and treats it as "not ready yet"
     rather than a real error.
     """
-    path = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
+    path = bd_url_to_ga4_path(url)
     end = date.today() - timedelta(days=1)
     start = end - timedelta(days=LOOKBACK_DAYS)
     req = RunReportRequest(
@@ -462,7 +511,7 @@ def get_outbound_click_stats(ga4_client, url):
 
 
 def get_ga4_stats(ga4_client, url, days=LOOKBACK_DAYS):
-    path = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
+    path = bd_url_to_ga4_path(url)
     end = date.today() - timedelta(days=1)
     start = end - timedelta(days=days)
     date_range = DateRange(start_date=start.isoformat(), end_date=end.isoformat())
