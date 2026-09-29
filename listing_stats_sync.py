@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.0
+Version: 1.5.1
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -67,6 +67,23 @@ Version: 1.5.0
           posted_date is null for every listing row, the field path in
           _extract_posted_date_iso() needs adjusting to whatever this
           endpoint actually returns.
+  1.5.1 — fixed a bug that silently wiped every listing's trend history on
+          2026-09-28. fetch_existing_json() only knew how to read GitHub's
+          Contents API when it returns file content inline, which only
+          happens under 1 MiB (1,048,576 bytes). history.json crossed that
+          line (1,072,223 bytes) and every subsequent fetch got a 200
+          response with no `content` field, which the old code treated as
+          "nothing to parse, start fresh" — so every listing's whole
+          history reset to a single point that run, all at once, with no
+          error surfaced anywhere a person would see it. Now falls back to
+          the `download_url` GitHub still provides for large files, which
+          has no such size limit. This does NOT restore the history lost
+          on 2026-09-28 — that data may still be recoverable from the
+          `mindthegaptutoring/lwea-search` repo's git commit history for
+          that file path, since publish_to_github overwrites the file's
+          current content but git itself keeps prior versions unless
+          history was force-pushed or squashed. Worth checking before
+          concluding it's gone for good.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -629,6 +646,22 @@ def fetch_existing_json(file_path):
     (parsed_json_or_None, sha_or_None). A missing file, a network hiccup, or
     unparseable content all just fall back to None — callers treat that as
     "start from scratch", never as a fatal error.
+
+    IMPORTANT: GitHub's Contents API only returns file content inline
+    (base64 in the `content` field) for files under 1 MiB (1,048,576 bytes).
+    Past that, `content` is omitted entirely and the API expects you to use
+    the `download_url` it still provides instead. history.json crossed that
+    line on 2026-09-28 (1,072,223 bytes) and every history point for every
+    listing silently reset to empty that run — not a partial loss, every
+    single listing lost its accumulated history at once, because this
+    function had no fallback and treated the missing `content` field as
+    "nothing to parse, start fresh". Confirmed by matching that exact wipe
+    date to the file crossing the exact 1 MiB boundary. Falls back to
+    `download_url` now so this can't recur purely from file growth. See
+    also HISTORY_MAX_WEEKS above — the file will keep growing indefinitely
+    at 52 weeks retention across a growing listing count, so this problem
+    class (some future limit, even with the fallback) is worth revisiting
+    if the file keeps climbing past a few MB.
     """
     api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
@@ -637,11 +670,29 @@ def fetch_existing_json(file_path):
         return None, None
     data = resp.json()
     sha = data.get("sha")
+
+    raw_content = data.get("content")
+    if raw_content:
+        try:
+            content = base64.b64decode(raw_content).decode("utf-8")
+            return json.loads(content), sha
+        except Exception as e:
+            print(f"  Could not parse existing {file_path} ({e}) — starting fresh.")
+            return None, sha
+
+    # content was empty/absent — almost certainly the >1MiB case, not a
+    # missing file (a missing file returns 404 above, not 200 with no
+    # content). Fetch the raw bytes directly instead.
+    download_url = data.get("download_url")
+    if not download_url:
+        print(f"  {file_path} returned no inline content and no download_url — starting fresh.")
+        return None, sha
     try:
-        content = base64.b64decode(data["content"]).decode("utf-8")
-        return json.loads(content), sha
+        raw_resp = requests.get(download_url)
+        raw_resp.raise_for_status()
+        return json.loads(raw_resp.text), sha
     except Exception as e:
-        print(f"  Could not parse existing {file_path} ({e}) — starting fresh.")
+        print(f"  Could not fetch/parse {file_path} via download_url ({e}) — starting fresh.")
         return None, sha
 
 
