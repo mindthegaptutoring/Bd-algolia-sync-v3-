@@ -59,11 +59,11 @@ from googleapiclient.discovery import build as gbuild
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 
 BACKFILL_WEEKS = int(os.environ.get("BACKFILL_WEEKS", "52"))
-
-
-def week_start(d: date) -> date:
-    """Monday of the ISO week containing d — the bucket key used throughout."""
-    return d - timedelta(days=d.weekday())
+# week_start() is now imported from listing_stats_sync (see the import block
+# above) instead of kept as a separate copy here — a second copy is exactly
+# how these two scripts could quietly drift out of alignment on what counts
+# as "the same week," which is the root of the bug fixed in
+# listing_stats_sync.py's build_updated_history this same session.
 
 
 def backfill_gsc_by_week(gsc_service, url, start: date, end: date) -> dict:
