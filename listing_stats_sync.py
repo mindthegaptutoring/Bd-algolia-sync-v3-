@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.3
+Version: 1.5.4
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -127,6 +127,26 @@ Version: 1.5.3
           counts as the same week" was exactly the kind of thing that
           could quietly drift apart between the two scripts, so there's
           now one definition both share.
+  1.5.4 — fixed real double-counting in the weekly history pull, found by
+          Kristen comparing the dashboard against the raw history.json
+          directly: a listing with zero impressions for 20+ straight weeks
+          got 3 real impressions, and BOTH the Sept 21 and Sept 28 history
+          points showed those same 3 impressions. 1.5.3 fixed how a point
+          gets *labeled and stored* (Monday-of-week, replace not append)
+          but never fixed what window of data gets *queried* for that
+          point — get_gsc_stats/get_ga4_stats's weekly call still used
+          "the 7 days ending near whenever the script happens to run,"
+          not a fixed calendar week. Two runs a few days apart (a
+          scheduled Monday run and a manual re-run days later, say) had
+          overlapping trailing windows and could both capture the same
+          real days' activity. Both functions now take optional
+          start_override/end_override so a caller can pin them to an
+          exact range; main() computes this_week_start/end once per run
+          (Monday through Sunday of the current week, clamped to each
+          API's own reporting lag) and passes that to the weekly pull
+          instead of a day-count. A week that hasn't started yet within
+          an API's lag window correctly returns zeros rather than
+          reaching backward into the prior week to fill the gap.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -406,9 +426,22 @@ def get_google_credentials():
 # ---------------------------------------------------------------------------
 # 3. Search Console: totals + top queries per URL
 # ---------------------------------------------------------------------------
-def get_gsc_stats(gsc_service, url, days=LOOKBACK_DAYS, include_queries=True):
-    end = date.today() - timedelta(days=3)   # GSC data lags ~2-3 days
-    start = end - timedelta(days=days)
+def get_gsc_stats(gsc_service, url, days=LOOKBACK_DAYS, include_queries=True, start_override=None, end_override=None):
+    """
+    start_override/end_override let a caller pin this to an exact calendar
+    range instead of "N days ending near today" — see main()'s weekly pull,
+    where this matters: a trailing window drifts with whenever the script
+    happens to run, so two runs a few days apart can both capture the same
+    underlying days, double-counting real activity across two "weekly"
+    history points. A fixed calendar week can't overlap its neighbors no
+    matter when in the week the script actually runs.
+    """
+    end = end_override if end_override is not None else (date.today() - timedelta(days=3))   # GSC data lags ~2-3 days
+    start = start_override if start_override is not None else (end - timedelta(days=days))
+    if start > end:
+        # Too early in the current week for GSC's lag to have any data yet
+        # — a real "nothing to report" state, not an error.
+        return {"clicks": 0, "impressions": 0, "ctr": 0.0, "position": 0.0, "top_queries": []}
 
     base_body = {
         "startDate": start.isoformat(),
@@ -529,10 +562,17 @@ def get_outbound_click_stats(ga4_client, url):
     return {row.dimension_values[0].value: int(row.metric_values[0].value) for row in resp.rows}
 
 
-def get_ga4_stats(ga4_client, url, days=LOOKBACK_DAYS):
+def get_ga4_stats(ga4_client, url, days=LOOKBACK_DAYS, start_override=None, end_override=None):
+    """See get_gsc_stats's docstring for why start_override/end_override
+    exist — same fixed-calendar-week reasoning applies here."""
     path = bd_url_to_ga4_path(url)
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=days)
+    end = end_override if end_override is not None else (date.today() - timedelta(days=1))
+    start = start_override if start_override is not None else (end - timedelta(days=days))
+    if start > end:
+        return {
+            "sessions": 0, "pageviews": 0, "avg_engagement_seconds": 0.0,
+            "traffic_sources": {}, "contact_clicks": 0 if CONTACT_EVENT_NAME else None,
+        }
     date_range = DateRange(start_date=start.isoformat(), end_date=end.isoformat())
     page_filter = FilterExpression(
         filter=Filter(field_name="pagePath", string_filter=Filter.StringFilter(value=path))
@@ -828,6 +868,20 @@ def main():
     listings = get_bd_listings()
     results = []
 
+    # The weekly history pull is pinned to THIS calendar week — Monday
+    # through the earliest of (Sunday, however far each API's own lag lets
+    # us see). Computed once, outside the loop, so every listing this run
+    # gets the exact same window. A trailing "7 days ending near whenever
+    # the script runs" window (the old approach) drifts with run timing —
+    # two runs a few days apart can both capture the same underlying days,
+    # double-counting real activity across two "weekly" points instead of
+    # each point representing one real, non-overlapping week. See
+    # get_gsc_stats/get_ga4_stats docstrings for the override mechanism.
+    this_week_start = week_start(date.today())
+    this_week_end = this_week_start + timedelta(days=6)
+    gsc_week_end = min(this_week_end, date.today() - timedelta(days=3))
+    ga4_week_end = min(this_week_end, date.today() - timedelta(days=1))
+
     # Pass 1: collect every listing's raw GSC/GA4 data. No triage flag yet --
     # the percentile cutoffs below can only be computed once this run's full
     # distribution is known.
@@ -848,12 +902,18 @@ def main():
             else:
                 ga4["outbound_clicks_by_domain"] = None
 
-            # Separate 7-day-only pull, for history.json ONLY — see
+            # Fixed-calendar-week pull, for history.json ONLY — see
             # make_history_point's docstring for why this can't reuse the
             # 28-day gsc/ga4 above. include_queries=False since history
             # doesn't need top_queries, saving one GSC call per listing.
-            gsc_week = get_gsc_stats(gsc_service, listing["url"], days=7, include_queries=False)
-            ga4_week = get_ga4_stats(ga4_client, listing["url"], days=7)
+            gsc_week = get_gsc_stats(
+                gsc_service, listing["url"], include_queries=False,
+                start_override=this_week_start, end_override=gsc_week_end,
+            )
+            ga4_week = get_ga4_stats(
+                ga4_client, listing["url"],
+                start_override=this_week_start, end_override=ga4_week_end,
+            )
 
             results.append({**listing, "gsc": gsc, "ga4": ga4, "_gsc_week": gsc_week, "_ga4_week": ga4_week})
         except Exception as e:
