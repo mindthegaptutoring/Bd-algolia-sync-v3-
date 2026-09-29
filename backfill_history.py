@@ -53,6 +53,7 @@ from google.analytics.data_v1beta.types import RunReportRequest, DateRange, Dime
 from listing_stats_sync import (
     get_google_credentials, get_bd_listings, fetch_existing_json, publish_to_github,
     GSC_SITE_URL, GA4_PROPERTY_ID, GITHUB_HISTORY_FILE_PATH, HISTORY_MAX_WEEKS,
+    bd_url_to_ga4_path,
 )
 from googleapiclient.discovery import build as gbuild
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
@@ -117,7 +118,7 @@ def backfill_ga4_by_week(ga4_client, url, start: date, end: date) -> dict:
     Same trailing-partial-week drop as backfill_gsc_by_week, for the same
     reason — keeps the two metrics' week boundaries aligned too.
     """
-    path = url if url.startswith("/") else "/" + url.split("/", 3)[-1]
+    path = bd_url_to_ga4_path(url)
     req = RunReportRequest(
         property=f"properties/{GA4_PROPERTY_ID}",
         dimensions=[Dimension(name="pagePath"), Dimension(name="date")],
