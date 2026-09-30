@@ -4,6 +4,10 @@ Optimized BD → Algolia sync script
 - Retries on 429/5xx with exponential backoff
 - Minimizes sleeps while staying rate-limit safe
 - Designed for Render cron (hourly or 2-hourly)
+- Multi-subject support (Sept 2026): each listing record carries a
+  `subjects` array = primary subject (BD post category) + up to
+  MAX_ADDITIONAL_SUBJECTS from the `additional_subjects` checkbox field.
+  `category` is kept unchanged as the single primary subject.
 """
 
 import os
@@ -40,6 +44,28 @@ BIO_CHAR_LIMIT   = 500
 SNIPPET_CHARS    = 205
 
 # ── Field mappings ────────────────────────────────────────────────────────────
+
+# Keys match the `additional_subjects` checkbox field (form field 418 on
+# classified_fields). Labels must match the Classes & Resources post
+# categories exactly so primary + additional subjects facet together.
+SUBJECT_MAP = {
+    "math":                             "Math",
+    "science_and_nature":               "Science and Nature",
+    "reading_and_writing":              "Reading and Writing",
+    "arts_and_making":                  "Arts and Making",
+    "world_languages":                  "World Languages",
+    "health_and_physical_education":    "Health and Physical Education",
+    "life_skills_and_entrepreneurship": "Life Skills and Entrepreneurship",
+    "history_and_culture":              "History and Culture",
+    "music":                            "Music",
+    "technology_and_coding":            "Technology and Coding",
+    "parent_support":                   "Parent Support",
+}
+
+MAX_ADDITIONAL_SUBJECTS = 4
+
+# Facets the search widget needs. Added to the index if missing.
+REQUIRED_FACETS = ["subjects"]
 
 FORMAT_MAP = {
     "1": "1-on-1 Teaching",
@@ -278,6 +304,28 @@ def resolve_tags(tags_str: str) -> list:
         return []
     return [t.strip() for t in tags_str.split(",") if t.strip()]
 
+def resolve_subjects(primary: str, additional_raw: str, gid: str = "") -> tuple:
+    """
+    Return (subjects, additional).
+    - subjects:   primary first, then additional subjects (deduped)
+    - additional: additional subjects only, primary removed, capped at
+                  MAX_ADDITIONAL_SUBJECTS (extra picks are dropped and logged)
+    """
+    primary = (primary or "").strip()
+    additional = []
+    for key in resolve_tags(additional_raw or ""):
+        label = SUBJECT_MAP.get(key, key)
+        if label and label != primary and label not in additional:
+            additional.append(label)
+
+    if len(additional) > MAX_ADDITIONAL_SUBJECTS:
+        print(f"  listing {gid}: {len(additional)} additional subjects picked, "
+              f"keeping first {MAX_ADDITIONAL_SUBJECTS}: {additional[:MAX_ADDITIONAL_SUBJECTS]}")
+        additional = additional[:MAX_ADDITIONAL_SUBJECTS]
+
+    subjects = ([primary] if primary else []) + additional
+    return subjects, additional
+
 # ── Record builders ───────────────────────────────────────────────────────────
 
 def build_educator_record(user: dict) -> dict:
@@ -354,6 +402,11 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
     cohort_raw  = resolve_tags(listing.get("cohort_size", ""))
     cohort_size = [COHORT_SIZE_MAP.get(c, c) for c in cohort_raw]
 
+    primary_subject = (listing.get("group_category") or "").strip()
+    subjects, additional_subjects = resolve_subjects(
+        primary_subject, listing.get("additional_subjects", ""), gid
+    )
+
     record = {
         "objectID":         f"listing_{gid}",
         "type":              "listing",
@@ -364,7 +417,9 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
         "snippet":           snippet,
         "thumbnail":         thumbnail,
         "tags":              tags,
-        "category":          (listing.get("group_category") or "").strip(),
+        "category":          primary_subject,
+        "subjects":          subjects,
+        "additional_subjects": additional_subjects,
         "listing_url":       f"{BD_BASE}/{listing.get('group_filename', '').lstrip('/')}",
         "post_link":         (listing.get("post_link") or "").strip(),
         "post_location":     (listing.get("post_location") or "").strip(),
@@ -387,11 +442,42 @@ def build_listing_record(listing: dict, educator_photo: str = "") -> dict:
 
     return enforce_byte_cap(record)
 
+# ── Index settings ────────────────────────────────────────────────────────────
+
+def ensure_facets(index) -> None:
+    """
+    Make sure every attribute in REQUIRED_FACETS is in attributesForFaceting.
+    Only writes if something is missing. Never removes existing facets.
+    If the API key lacks the editSettings permission, logs a warning and
+    carries on (add the facet manually in the Algolia dashboard instead).
+    """
+    try:
+        settings = index.get_settings()
+        current  = settings.get("attributesForFaceting") or []
+        # filterOnly(x) facets return no counts, so the sidebar filter
+        # would render empty. Treat them as missing and replace them.
+        kept     = [a for a in current
+                    if not (a.startswith("filterOnly(")
+                            and a[len("filterOnly("):-1] in REQUIRED_FACETS)]
+        existing = {a.split("(")[-1].rstrip(")") for a in kept}
+        missing  = [f for f in REQUIRED_FACETS if f not in existing]
+        if not missing and kept == current:
+            print(f"  Facets OK: {REQUIRED_FACETS}")
+            return
+        index.set_settings({"attributesForFaceting": kept + missing}).wait()
+        print(f"  Updated facets, added: {missing}")
+    except Exception as e:
+        print(f"  WARNING: could not verify/add facets {REQUIRED_FACETS}: {e}")
+        print("  Add them in Algolia > Index > Configuration > Facets.")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     client = SearchClient.create(ALGOLIA_APP_ID, ALGOLIA_WRITE_KEY)
     index  = client.init_index(ALGOLIA_INDEX_NAME)
+
+    print("Checking index facets…")
+    ensure_facets(index)
 
     print("Getting total member count…")
     total_members = get_total_member_count()
