@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.5
+Version: 1.5.6
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -162,6 +162,15 @@ Version: 1.5.5
           guess, not confirmed against this script's own auth context —
           wrapped in its own try/except so a wrong guess fails quietly
           rather than taking anything else down with it.
+  1.5.6 — fetch_and_publish_reviews() now skips the GitHub write when the
+          approved reviews are identical to what's already published
+          (generated_at is excluded from the comparison, since it changes
+          daily regardless). Without this, a frequently-scheduled reviews
+          job commits an identical reviews.json every run. Each
+          educator's reviews are also now sorted newest-first before
+          publishing: Widget 55 shows the first five in file order, so
+          this is what makes it show the newest five, and a stable order
+          is what lets the unchanged-check work reliably.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -904,6 +913,26 @@ def fetch_and_publish_reviews():
                 "review_added": r.get("review_added", ""),
                 "rating_overall": r.get("rating_overall", "5"),
             })
+
+        # Newest first. Two reasons: Widget 55 shows the first 5 in file
+        # order, so this is what makes it show each educator's NEWEST
+        # five; and a stable order means an unchanged set of reviews
+        # always produces an identical file, which the skip check below
+        # depends on. review_added is a YYYYMMDDHHMMSS string, so plain
+        # string comparison sorts it correctly.
+        for uid in by_user:
+            by_user[uid].sort(key=lambda rv: str(rv.get("review_added", "")), reverse=True)
+
+        # Skip the write when nothing changed. This job can run often, and
+        # without this it commits an identical file every time (noise in
+        # the repo history, and a possible Pages rebuild per commit).
+        # generated_at is deliberately left out of the comparison, since it
+        # changes daily even when no review does. If the existing file
+        # can't be read for any reason, fall through and publish.
+        existing, _ = fetch_existing_json("listing-stats/reviews.json")
+        if existing is not None and existing.get("reviews") == by_user:
+            print(f"  reviews unchanged ({len(by_user)} educators, {len(rows)} reviews) — skipped write")
+            return
 
         payload = {"generated_at": date.today().isoformat(), "reviews": by_user}
         publish_to_github(payload, "listing-stats/reviews.json")
