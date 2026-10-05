@@ -24,14 +24,14 @@ GSC or GA4):
 
 DEPLOYMENT: a separate Render Cron Job, same repo as listing_stats_sync.py
 and backfill_history.py (this file must sit alongside listing_stats_sync.py
-since it imports from it), running on a much shorter interval — every 15
-minutes is a reasonable starting point given how lightweight this job is
-(one BD API call, one small GitHub file write). Adjust freely; there's
-no real cost to running this more often.
+since it imports from it), running on a much shorter interval than the
+weekly stats sync. This job is lightweight (one BD API call, and a GitHub
+write only when the reviews actually changed), so the schedule can be as
+frequent as you want without adding repo noise.
 
 Build command (same as the other two scripts): pip install -r requirements.txt
 Start command: python reviews_sync.py
-Schedule: */15 * * * *
+Schedule: e.g. */15 * * * * (every 15 minutes), or whatever cadence you prefer
 """
 
 from listing_stats_sync import fetch_and_publish_reviews
