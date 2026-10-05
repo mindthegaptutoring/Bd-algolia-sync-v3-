@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.4
+Version: 1.5.5
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -147,6 +147,21 @@ Version: 1.5.4
           instead of a day-count. A week that hasn't started yet within
           an API's lag window correctly returns zeros rather than
           reaching backward into the prior week to fill the gap.
+  1.5.5 — added fetch_and_publish_reviews(), publishing reviews.json
+          alongside results.json/history.json. Feeds Widget 55
+          (LWEA - Listing Reviews), which shows an educator's real,
+          approved reviews on their Classes & Resources listing pages
+          without them needing to paste testimonial text into every
+          listing — the exact habit behind several duplicate-content
+          problems found and fixed this session. NOT wired into this
+          file's own main() — see the function's docstring — reviews
+          need a much faster refresh cadence than this script's weekly
+          schedule, so a separate script (reviews_sync.py) calls this
+          function on its own frequent cron instead. UNVERIFIED: the
+          endpoint path (/users_reviews/get) is a naming-convention
+          guess, not confirmed against this script's own auth context —
+          wrapped in its own try/except so a wrong guess fails quietly
+          rather than taking anything else down with it.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -834,6 +849,67 @@ def fetch_existing_json(file_path):
     except Exception as e:
         print(f"  Could not fetch/parse {file_path} via download_url ({e}) — starting fresh.")
         return None, sha
+
+
+def fetch_and_publish_reviews():
+    """
+    Publishes reviews.json — {user_id: [review, ...]} for every APPROVED
+    review (review_status == 2) sitewide, grouped by the reviewed
+    educator's user_id. Consumed by Widget 55 (LWEA - Listing Reviews) so
+    a listing page can show that educator's real reviews without an
+    educator needing to paste testimonial text into every listing — the
+    exact behavior that caused the duplicate-content problems found and
+    fixed on several accounts this session (Deanna, Paige, Amy).
+
+    NOT called from this file's own main() — reviews need to show up far
+    faster than this script's weekly cadence allows (a new review
+    shouldn't take up to 7 days to appear). Called instead by
+    reviews_sync.py, a small standalone script on its own, much more
+    frequent cron schedule. Defined here (rather than duplicated there)
+    so it shares bd_get/publish_to_github and this file's auth constants
+    with everything else — reviews_sync.py just imports this function.
+
+    UNVERIFIED: the endpoint path and param names below are a best-effort
+    guess based on this script's other endpoints' naming convention
+    (users_portfolio_groups/get, user/get) — reviews was only confirmed
+    reachable through the separate admin-tooling API used to build the
+    first version of reviews.json by hand, not through this script's own
+    BD_API_KEY auth context. Wrapped defensively: if the endpoint or
+    response shape is wrong, this fails quietly and the rest of the
+    regular sync run (listings, history) proceeds unaffected — reviews.json
+    just doesn't get refreshed that run. Check results after first deploy;
+    if review counts aren't climbing as real new reviews come in, this
+    endpoint guess needs correcting.
+    """
+    try:
+        resp = bd_get("/users_reviews/get", {
+            "where[review_status]": 2,
+            "limit": 500,
+        })
+        rows = resp.get("data") or resp.get("message") or []
+        if not isinstance(rows, list):
+            print("  reviews fetch: unexpected response shape, skipping this run")
+            return
+
+        by_user = {}
+        for r in rows:
+            uid = str(r.get("user_id", ""))
+            if not uid:
+                continue
+            by_user.setdefault(uid, []).append({
+                "review_id": r.get("review_id"),
+                "review_title": r.get("review_title", ""),
+                "review_description": r.get("review_description", ""),
+                "review_name": r.get("review_name", ""),
+                "review_added": r.get("review_added", ""),
+                "rating_overall": r.get("rating_overall", "5"),
+            })
+
+        payload = {"generated_at": date.today().isoformat(), "reviews": by_user}
+        publish_to_github(payload, "listing-stats/reviews.json")
+        print(f"  reviews.json published — {len(by_user)} educators, {len(rows)} reviews")
+    except Exception as e:
+        print(f"  reviews fetch failed ({e}) — skipping this run, rest of sync unaffected")
 
 
 def publish_to_github(payload, file_path):
