@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.6
+Version: 1.5.7
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -171,6 +171,24 @@ Version: 1.5.6
           publishing: Widget 55 shows the first five in file order, so
           this is what makes it show the newest five, and a stable order
           is what lets the unchanged-check work reliably.
+  1.5.7 — fixed a silent data-loss bug found after the 2026-10-05 weekly run,
+          when a dashboard showed an educator's profile but none of her
+          listings. A BD lookup that failed (after bd_request's own retries)
+          was swallowed: get_all_active_users counted it as "no such user" and
+          skipped the educator entirely, and get_bd_listings caught a failed
+          listing fetch, printed it, and moved on. The run then published
+          whatever it had, overwriting good data with incomplete data, and
+          because history.json was rebuilt only from the rows present, every
+          dropped listing also lost its whole weekly history. That run lost
+          15 rows (10 of them live pages, including a still-active paying
+          educator). Now: failed user lookups are retried after cool-downs and
+          never counted as misses; listing fetches retry 3 times with
+          backoff; any educator still failing has their previous rows carried
+          forward (flagged carried_forward) so they still get fresh Search
+          Console / GA4 numbers; the run aborts without publishing if BD is
+          failing broadly (15 lookups in a row) or if failures leave it more
+          than 10% smaller than the last published file; and history for a
+          URL missing from a run is kept for 12 weeks instead of deleted.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -323,33 +341,87 @@ def _extract_posted_date_iso(listing: dict):
         return None
 
 
-def get_all_active_users() -> list:
+def _fetch_user(uid):
+    """One /user/get lookup. Returns the user dict, or None if BD says there
+    is no such user. RAISES if the request itself failed -- callers must
+    treat a failed lookup differently from "no such user"."""
+    data = bd_get("/user/get", params={"property": "user_id", "property_value": str(uid)})
+    msg = data.get("message") or []
+    return msg[0] if isinstance(msg, list) and msg else None
+
+
+def _user_is_wanted(user):
+    sub_id = str(user.get("subscription_id", ""))
+    is_active = str(user.get("active", "")) == ACTIVE_USER
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+    return bool(is_active and name and sub_id not in ("4", "7"))
+
+
+def get_all_active_users(failed_uids=None) -> list:
     """Probe user_id 1..MAX_USER_ID, same consecutive-miss stop logic as
-    bd_algolia_sync_v3.py (BD has no bulk user list, so this is the only way in)."""
+    bd_algolia_sync_v3.py (BD has no bulk user list, so this is the only way in).
+
+    FIXED in 1.5.7: a lookup that FAILED (after bd_request's own retries) used
+    to be counted as a "miss" and the educator was silently skipped, so one bad
+    API moment deleted a real, active educator's profile and every listing
+    from the published file. Now a failed lookup is remembered, retried after a
+    cool-down (BD rate-limits at ~100 req/min, and other jobs share that
+    budget), and anything still failing is reported through failed_uids so the
+    caller can carry that educator's previous rows forward. A failed lookup also
+    no longer counts toward the 20-consecutive-misses stop. If BD is failing
+    on 15 lookups in a row the whole run aborts instead of publishing."""
     users = []
+    failed = []
     consecutive_misses = 0
+    consecutive_errors = 0
     for uid in range(1, MAX_USER_ID + 1):
         try:
-            data = bd_get("/user/get", params={"property": "user_id", "property_value": str(uid)})
-            msg = data.get("message") or []
-            user = msg[0] if isinstance(msg, list) and msg else None
-            if user:
-                consecutive_misses = 0
-                sub_id = str(user.get("subscription_id", ""))
-                is_active = str(user.get("active", "")) == ACTIVE_USER
-                name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-                if is_active and name and sub_id not in ("4", "7"):
-                    users.append(user)
-                time.sleep(0.5)
-            else:
-                consecutive_misses += 1
-                if users and consecutive_misses >= 20:
-                    print(f"  20 consecutive misses after user_id={uid - 1}, stopping probe.")
-                    break
+            user = _fetch_user(uid)
+            consecutive_errors = 0
         except Exception as e:
-            print(f"  user_id={uid} error: {e}")
-            consecutive_misses += 1
+            print(f"  user_id={uid} lookup FAILED: {e}")
+            failed.append(uid)
+            consecutive_errors += 1
+            if consecutive_errors >= 15:
+                raise RuntimeError(
+                    "BD API failed 15 user lookups in a row; aborting the run "
+                    "before anything is published so last week's data stays intact."
+                )
             time.sleep(1.0)
+            continue
+        if user:
+            consecutive_misses = 0
+            if _user_is_wanted(user):
+                users.append(user)
+            time.sleep(0.5)
+        else:
+            consecutive_misses += 1
+            if users and consecutive_misses >= 20:
+                print(f"  20 consecutive misses after user_id={uid - 1}, stopping probe.")
+                break
+
+    for wait in (30, 60):
+        if not failed:
+            break
+        print(f"  retrying {len(failed)} failed user lookup(s) after a {wait}s cool-down...")
+        time.sleep(wait)
+        still_failed = []
+        for uid in failed:
+            try:
+                user = _fetch_user(uid)
+            except Exception as e:
+                print(f"  user_id={uid} still failing: {e}")
+                still_failed.append(uid)
+                time.sleep(1.0)
+                continue
+            if user and _user_is_wanted(user):
+                users.append(user)
+            time.sleep(0.5)
+        failed = still_failed
+
+    users.sort(key=lambda u: int(u.get("user_id") or 0))
+    if failed_uids is not None:
+        failed_uids.extend(failed)
     return users
 
 
@@ -386,14 +458,24 @@ def get_user_listings(user_id: str) -> list:
     ]
 
 
-def get_bd_listings() -> list:
+def get_bd_listings(failures=None) -> list:
     """
     Returns [{member_id, member_name, url, title, post_type}, ...] covering
     both each educator's profile page and their individual published
     Classes & Resources listings.
+
+    failures (optional dict) is filled with {"users": [...], "listings": [...]}:
+    user_ids whose lookup failed, and user_ids whose listing fetch failed
+    even after retries. See main() / carry_forward_failed() for what happens
+    to them -- they are NOT treated as "this educator has no listings."
     """
-    print("Probing BD for active educators…")
-    users = get_all_active_users()
+    if failures is None:
+        failures = {}
+    failures.setdefault("users", [])
+    failures.setdefault("listings", [])
+
+    print("Probing BD for active educators...")
+    users = get_all_active_users(failed_uids=failures["users"])
     print(f"{len(users)} active educators found")
 
     results = []
@@ -412,9 +494,20 @@ def get_bd_listings() -> list:
                 "posted_date": (user.get("signup_date") or "")[:10] or None,  # BD returns ISO datetime, take just the date part
             })
 
-        print(f"  [{i}/{len(users)}] {name} (user_id={uid}) — fetching listings")
-        try:
-            for listing in get_user_listings(uid):
+        print(f"  [{i}/{len(users)}] {name} (user_id={uid}) - fetching listings")
+        user_listings = None
+        for attempt in range(3):
+            try:
+                user_listings = get_user_listings(uid)
+                break
+            except Exception as e:
+                print(f"  listings error for user_id={uid} (attempt {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(20 * (attempt + 1))
+        if user_listings is None:
+            failures["listings"].append(uid)
+        else:
+            for listing in user_listings:
                 group_filename = (listing.get("group_filename") or "").lstrip("/")
                 if not group_filename:
                     continue
@@ -426,12 +519,54 @@ def get_bd_listings() -> list:
                     "post_type": "listing",
                     "posted_date": _extract_posted_date_iso(listing),
                 })
-        except Exception as e:
-            print(f"  listings error for user_id={uid}: {e}")
 
-        time.sleep(3.0)  # same per-user pacing as bd_algolia_sync_v3.py — keeps this under BD's ~100 req/min limit
+        time.sleep(3.0)  # same per-user pacing as bd_algolia_sync_v3.py -- keeps this under BD's ~100 req/min limit
 
     return results
+
+
+def carry_forward_failed(listings, failures):
+    """
+    For educators whose BD lookup or listing fetch FAILED this run (not
+    educators BD successfully reported as inactive or having no listings),
+    re-add their rows from the last published results.json so they still get
+    fresh Search Console / GA4 numbers instead of vanishing. Their title,
+    URL and posted date are reused; only the BD lookup is skipped.
+
+    Also the publish guard: if there were failures and the run still ends up
+    more than 10% smaller than the last published file, abort instead of
+    overwriting good data with a lopsided run.
+    """
+    failed_ids = {str(u) for u in failures.get("users", [])} | {str(u) for u in failures.get("listings", [])}
+    if not failed_ids:
+        return listings
+
+    print(f"BD lookups failed for user_id(s): {sorted(failed_ids, key=int)}")
+    prev, _ = fetch_existing_json(GITHUB_FILE_PATH)
+    prev_rows = (prev or {}).get("listings") or []
+    have = {l["url"] for l in listings}
+    carried = []
+    for row in prev_rows:
+        if str(row.get("member_id")) in failed_ids and row.get("url") not in have:
+            carried.append({
+                "member_id": row.get("member_id"),
+                "member_name": row.get("member_name"),
+                "url": row.get("url"),
+                "title": row.get("title"),
+                "post_type": row.get("post_type"),
+                "posted_date": row.get("posted_date"),
+                "carried_forward": True,
+            })
+    print(f"Carrying forward {len(carried)} row(s) from the last published results for those educators.")
+    merged = listings + carried
+
+    if prev_rows and len(merged) < 0.9 * len(prev_rows):
+        raise SystemExit(
+            f"ABORTING: BD lookups failed AND this run has {len(merged)} rows vs "
+            f"{len(prev_rows)} last time (more than 10% smaller). Nothing was published, "
+            f"so the current results.json and history.json are untouched. Re-run once BD is responding."
+        )
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -795,6 +930,16 @@ def build_updated_history(results, existing_history_index):
             prior = [p for p in prior if p.get("date") != point["date"]]
             prior.append(point)
         new_index[url] = prior[-HISTORY_MAX_WEEKS:]
+
+    # Keep the history of any URL that is missing from THIS run, as long as it
+    # has a point from the last 12 weeks. Before 1.5.7 this index was built only
+    # from the rows present in the run, so a listing that dropped out for one
+    # run (a failed BD fetch) lost its whole weekly history the same moment.
+    # Pruning after 12 weeks stops deleted listings from piling up forever.
+    cutoff = (date.today() - timedelta(days=84)).isoformat()
+    for url, pts in existing_history_index.items():
+        if url not in new_index and pts and str(pts[-1].get("date", "")) >= cutoff:
+            new_index[url] = pts
     return new_index
 
 
@@ -970,7 +1115,9 @@ def main():
     gsc_service = gbuild("searchconsole", "v1", credentials=creds)
     ga4_client = BetaAnalyticsDataClient(credentials=creds)
 
-    listings = get_bd_listings()
+    bd_failures = {}
+    listings = get_bd_listings(bd_failures)
+    listings = carry_forward_failed(listings, bd_failures)
     results = []
 
     # The weekly history pull is pinned to THIS calendar week — Monday
