@@ -43,3 +43,16 @@ jobs:
           GITHUB_REPO: mindthegaptutoring/lwea-search
           BACKFILL_WEEKS: ${{ github.event.inputs.backfill_weeks }}
         run: python backfill_history.py
+
+      # Keep the finished result even if the publish step above fails. If this
+      # job ends red, open the run, download "history-backfill-output" from the
+      # Artifacts section, and upload history_backfill_output.json to
+      # listing-stats/ in the lwea-search repo, renamed to history.json.
+      - name: Keep the result in case the publish failed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-backfill-output
+          path: history_backfill_output.json
+          if-no-files-found: ignore
+          retention-days: 14
