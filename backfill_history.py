@@ -52,7 +52,7 @@ from google.analytics.data_v1beta.types import RunReportRequest, DateRange, Dime
 
 from listing_stats_sync import (
     get_google_credentials, get_bd_listings, fetch_existing_json, publish_to_github,
-    row_key, migrate_history_keys,
+    row_key, migrate_history_keys, week_start,
     GSC_SITE_URL, GA4_PROPERTY_ID, GITHUB_HISTORY_FILE_PATH, HISTORY_MAX_WEEKS,
     bd_url_to_ga4_path,
 )
@@ -99,8 +99,10 @@ def backfill_gsc_by_week(gsc_service, url, start: date, end: date) -> dict:
 
     result = {}
     for wk, b in buckets.items():
+        if wk < start:
+            continue  # leading partial week: the window began mid-week, so only some of its days were pulled
         if wk + timedelta(days=6) > end:
-            continue  # partial week — see docstring
+            continue  # trailing partial week — see docstring
         impressions = b["impressions"]
         result[wk.isoformat()] = {
             "impressions": impressions,
@@ -142,8 +144,10 @@ def backfill_ga4_by_week(ga4_client, url, start: date, end: date) -> dict:
 
     result = {}
     for wk, b in buckets.items():
+        if wk < start:
+            continue  # leading partial week: the window began mid-week, so only some of its days were pulled
         if wk + timedelta(days=6) > end:
-            continue  # partial week — see docstring
+            continue  # trailing partial week — see docstring
         sessions = b["sessions"]
         result[wk.isoformat()] = {
             "sessions": sessions,
