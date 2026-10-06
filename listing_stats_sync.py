@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.7
+Version: 1.5.9
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -189,6 +189,38 @@ Version: 1.5.7
           failing broadly (15 lookups in a row) or if failures leave it more
           than 10% smaller than the last published file; and history for a
           URL missing from a run is kept for 12 weeks instead of deleted.
+  1.5.8 — fixed 1.5.4's weekly points, found while comparing against the
+          September server-log traffic report (2026-10-06): the Oct 5 point
+          was ZERO for all 155 URLs. 1.5.4 pinned each weekly pull to the
+          current Monday-Sunday week, but the cron fires on Monday, before
+          the new week has any data either API can return (GA4's end is
+          yesterday, which is last Sunday, so the window ended before it
+          began), so every Monday run appended a zero point to every chart and
+          the week that had just ended was never captured. Now each run pulls
+          the two most recent COMPLETE weeks and replaces those points: the
+          newest, and the one before it so its last Search Console days (3 day
+          lag) get filled in. Current-week points are purged on every run,
+          which also clears the zero point already written. Because the
+          newest complete week is now overwritten with true calendar-week
+          numbers, it also replaces the 2026-09-28 point, which had been
+          captured by the older trailing-window logic.
+  1.5.9 — history is now keyed by a stable id instead of the URL. BD rewrites a
+          listing's URL whenever its title changes, which stranded the old
+          URL's weekly history and started the renamed listing's chart empty
+          (two listings in one week). Each row now carries id = profile_<user_id>
+          or listing_<group_id> (the same objectID convention as the Algolia
+          index) and history.json is keyed by it. Old URL-keyed files are
+          converted automatically on the first run: each URL is matched to its
+          row, or followed through BD's redirect when the listing was renamed
+          before this change, and series that land on one id are merged by week.
+          A rename is also detected going forward (same id, different url than
+          the last published results.json); the old URL is kept as an alias for
+          35 days and its traffic is summed into both the 28-day numbers and
+          the weekly points, so the weeks around a rename are not split in half.
+          results.json rows carry id and, while it applies, aliases; the widget
+          looks history up by id and falls back to url. history.json also gains
+          a readable id -> current url map under "urls". backfill_history.py
+          uses the same keys.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -219,7 +251,7 @@ import random
 import base64
 import requests
 from datetime import date, timedelta
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
@@ -486,6 +518,7 @@ def get_bd_listings(failures=None) -> list:
 
         if filename:
             results.append({
+                "id": profile_id(uid),
                 "member_id": uid,
                 "member_name": name,
                 "url": f"{BD_BASE}/{filename}",
@@ -511,7 +544,9 @@ def get_bd_listings(failures=None) -> list:
                 group_filename = (listing.get("group_filename") or "").lstrip("/")
                 if not group_filename:
                     continue
+                gid = listing.get("group_id")
                 results.append({
+                    "id": listing_id(gid) if gid else None,
                     "member_id": uid,
                     "member_name": name,
                     "url": f"{BD_BASE}/{group_filename}",
@@ -525,7 +560,7 @@ def get_bd_listings(failures=None) -> list:
     return results
 
 
-def carry_forward_failed(listings, failures):
+def carry_forward_failed(listings, failures, prev_rows=None):
     """
     For educators whose BD lookup or listing fetch FAILED this run (not
     educators BD successfully reported as inactive or having no listings),
@@ -542,13 +577,17 @@ def carry_forward_failed(listings, failures):
         return listings
 
     print(f"BD lookups failed for user_id(s): {sorted(failed_ids, key=int)}")
-    prev, _ = fetch_existing_json(GITHUB_FILE_PATH)
-    prev_rows = (prev or {}).get("listings") or []
+    if prev_rows is None:
+        prev, _ = fetch_existing_json(GITHUB_FILE_PATH)
+        prev_rows = (prev or {}).get("listings") or []
     have = {l["url"] for l in listings}
     carried = []
     for row in prev_rows:
         if str(row.get("member_id")) in failed_ids and row.get("url") not in have:
             carried.append({
+                # rows published before 1.5.9 have no id; a profile's is derivable
+                "id": row.get("id") or (profile_id(row.get("member_id")) if row.get("post_type") == "profile" else None),
+                "aliases": row.get("aliases"),
                 "member_id": row.get("member_id"),
                 "member_name": row.get("member_name"),
                 "url": row.get("url"),
@@ -866,35 +905,279 @@ def week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
-def make_history_point(r):
-    """One compact weekly snapshot for the trend chart. Deliberately lean —
-    only what a trend line actually needs, not the full result row (no
-    top_queries, no traffic_sources breakdown — those stay snapshot-only).
+# ---------------------------------------------------------------------------
+# 6a. Stable IDs, renames, and history keyed by ID (NEW in 1.5.9)
+#
+# History used to be keyed by URL. BD regenerates a listing's URL whenever its
+# title changes, so a rename left the old URL's weekly history stranded and the
+# new URL started with an empty chart (seen when two listings were renamed in
+# one week). Every row now carries an "id" that never changes -- profile_<user_id>
+# or listing_<group_id>, the same objectID convention bd_algolia_sync_v3.py uses
+# in Algolia -- and history.json is keyed by that.
+# ---------------------------------------------------------------------------
+ALIAS_DAYS = 35   # how long a renamed listing's OLD url keeps being queried alongside the new one
 
-    IMPORTANT: reads from r["_gsc_week"] / r["_ga4_week"] — a separate
-    7-day-only pull done alongside the normal 28-day snapshot pull (see
-    main()), NOT from r["gsc"] / r["ga4"], which are 28-day rolling totals.
-    Mixing a 28-day total into the same trend array as backfill_history.py's
-    true 7-day weekly buckets would make every point look ~4x too high
-    right where live data picks up from backfilled data — same number,
-    different unit, silently wrong.
 
-    "date" is the Monday of the current week, not date.today() — see
-    build_updated_history's docstring for why that distinction matters."""
-    gsc = r.get("_gsc_week", {})
-    ga4 = r.get("_ga4_week", {})
-    return {
-        "date": week_start(date.today()).isoformat(),
-        "impressions": gsc.get("impressions", 0),
-        "clicks": gsc.get("clicks", 0),
-        "ctr": gsc.get("ctr", 0.0),
-        "position": gsc.get("position", 0.0),
-        "sessions": ga4.get("sessions", 0),
-        "avg_engagement_seconds": ga4.get("avg_engagement_seconds", 0.0),
-        "contact_clicks": ga4.get("contact_clicks"),
-        "connect_pageviews": ga4.get("connect_pageviews"),
-        "triage_flag": r.get("triage_flag", "error"),
-    }
+def profile_id(user_id):
+    return f"profile_{user_id}"
+
+
+def listing_id(group_id):
+    return f"listing_{group_id}"
+
+
+def row_key(r):
+    """History key for a result row: its stable id, or (only if BD gave no
+    group_id) a url-based fallback so the row still gets a series."""
+    return r.get("id") or ("url:" + str(r.get("url", "")))
+
+
+def _norm_url(u):
+    return unquote(str(u)).rstrip("/").lower()
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def merge_period_stats(a, b):
+    """
+    Combine two stats dicts for the SAME period from two URLs (a renamed
+    listing's new and old address). Counts and dict-of-counts are summed;
+    ctr, position and avg_engagement_seconds are recomputed from the sums
+    (position weighted by impressions, engagement by sessions); lists such as
+    top_queries are taken from `a`, the primary. Works on both the 28-day
+    snapshot dicts and the weekly history points.
+    """
+    out = dict(a)
+    for k, v in b.items():
+        if k in ("ctr", "position", "avg_engagement_seconds", "top_queries"):
+            continue
+        if _num(v):
+            out[k] = (a.get(k) if _num(a.get(k)) else 0) + v
+        elif isinstance(v, dict) and v and all(_num(x) for x in v.values()):
+            d = dict(a.get(k) or {})
+            for kk, vv in v.items():
+                d[kk] = (d.get(kk) or 0) + vv
+            out[k] = d
+    ia, ib = (a.get("impressions") or 0), (b.get("impressions") or 0)
+    sa, sb = (a.get("sessions") or 0), (b.get("sessions") or 0)
+    if "position" in a or "position" in b:
+        pa, pb = (a.get("position") or 0.0), (b.get("position") or 0.0)
+        out["position"] = round((pa * ia + pb * ib) / (ia + ib), 1) if (ia + ib) else (pa or pb or 0.0)
+    if "ctr" in a or "ctr" in b:
+        imp = out.get("impressions") or 0
+        out["ctr"] = ((out.get("clicks") or 0) / imp) if imp else 0.0
+    if "avg_engagement_seconds" in a or "avg_engagement_seconds" in b:
+        ea, eb = (a.get("avg_engagement_seconds") or 0.0), (b.get("avg_engagement_seconds") or 0.0)
+        out["avg_engagement_seconds"] = round((ea * sa + eb * sb) / (sa + sb), 1) if (sa + sb) else (ea or eb or 0.0)
+    return out
+
+
+def fetch_period(fn, urls, **kw):
+    """Run a per-URL stats function for the current URL and any aliases, and
+    merge. The first URL is the primary: if it fails the error propagates (the
+    row becomes an error row, as before); a failing alias is skipped, since it
+    only adds a rename's pre-rename traffic."""
+    out = fn(urls[0], **kw)
+    for u in urls[1:]:
+        try:
+            out = merge_period_stats(out, fn(u, **kw))
+        except Exception as e:
+            print(f"  alias url failed, skipping ({u}): {e}")
+    return out
+
+
+def merge_history_point(a, b):
+    """Two weekly points for the same week (the same listing under two URLs)."""
+    out = merge_period_stats(a, b)
+    out["date"] = a.get("date") or b.get("date")
+    out["triage_flag"] = b.get("triage_flag") if b.get("triage_flag") is not None else a.get("triage_flag")
+    return out
+
+
+def merge_history_lists(a, b):
+    """Merge two weekly-point lists by week; an overlapping week is summed."""
+    by_date = {p["date"]: p for p in a}
+    for p in b:
+        by_date[p["date"]] = merge_history_point(by_date[p["date"]], p) if p["date"] in by_date else p
+    return [by_date[d] for d in sorted(by_date)]
+
+
+def resolve_redirect(url, max_hops=3):
+    """Follow a URL's redirects (BD 301s an old slug to the new one) and return
+    where it lands, or None. Only used once, to migrate old URL-keyed history."""
+    cur = url
+    for _ in range(max_hops):
+        try:
+            r = requests.get(cur, allow_redirects=False, timeout=20, headers={"User-Agent": "LWEA-stats-sync"})
+        except Exception:
+            return None
+        loc = r.headers.get("Location")
+        if r.status_code in (301, 302, 303, 307, 308) and loc:
+            try:   # requests decodes header bytes as latin-1; slugs with emoji are raw UTF-8
+                loc = loc.encode("latin-1").decode("utf-8")
+            except Exception:
+                pass
+            cur = urljoin(cur, loc)
+        else:
+            return cur if cur != url else None
+    return cur
+
+
+def _active_weeks(points):
+    return {p["date"] for p in points if (p.get("sessions") or 0) + (p.get("impressions") or 0) > 0}
+
+
+def migrate_history_keys(history_index, rows, resolve=None):
+    """
+    One-time, automatic: convert URL-keyed history (keys starting "http") to
+    id-keyed.
+
+    1. A URL equal to a row's current URL or a known alias is that row's series.
+    2. Any other URL (a listing renamed before aliases existed, or a page that
+       was deleted) is followed through BD's redirect. If it lands on a row's
+       URL it is merged into that row's series, by week, but ONLY when the two
+       series never ran side by side (at most one week of activity in common).
+       A rename is sequential: the old URL's traffic stops as the new one
+       starts. A deleted duplicate that redirects to a surviving listing has
+       traffic running in parallel with it, and merging that would inflate the
+       survivor's chart, so it is kept apart instead.
+    3. Anything left over is kept under "url:<url>" and ages out after 12 weeks
+       like any other absent series.
+    No-op once the keys are ids.
+    """
+    legacy = [k for k in history_index if str(k).startswith("http")]
+    if not legacy:
+        return history_index
+    url_to_id = {}
+    for r in rows:
+        rid = r.get("id")
+        if not rid:
+            continue
+        url_to_id[_norm_url(r["url"])] = rid
+        for al in r.get("aliases") or []:
+            url_to_id.setdefault(_norm_url(al["url"]), rid)
+    resolver = resolve if resolve is not None else resolve_redirect
+    out = {k: v for k, v in history_index.items() if k not in legacy}
+    direct = followed = parallel = orphaned = 0
+
+    pending = []
+    for url in legacy:                       # pass 1: exact matches, so every target series exists
+        rid = url_to_id.get(_norm_url(url))
+        if rid is None:
+            pending.append(url)
+            continue
+        out[rid] = merge_history_lists(out[rid], history_index[url]) if rid in out else list(history_index[url])
+        direct += 1
+
+    for url in pending:                      # pass 2: renamed or deleted pages
+        pts = history_index[url]
+        final = resolver(url)
+        rid = url_to_id.get(_norm_url(final)) if final else None
+        if rid is not None and len(_active_weeks(pts) & _active_weeks(out.get(rid, []))) <= 1:
+            out[rid] = merge_history_lists(out[rid], pts) if rid in out else list(pts)
+            followed += 1
+            continue
+        if rid is not None:
+            parallel += 1
+        else:
+            orphaned += 1
+        out["url:" + url] = list(pts)
+    print(f"  history keys migrated to ids: {direct} direct, {followed} renamed (merged via redirect), "
+          f"{parallel} redirect to a listing with parallel traffic (kept apart), {orphaned} unmatched (kept as url: keys)")
+    return out
+
+
+def attach_aliases(listings, prev_rows, today=None):
+    """
+    Detect renames: a row whose id is in the last published results.json under a
+    DIFFERENT url was renamed. Record the old url as an alias (with the date it
+    was first seen) so its pre-rename traffic keeps being added in for ALIAS_DAYS,
+    long enough for the weeks around the rename to settle. Aliases already on
+    the previous row are carried forward until they expire.
+    """
+    today = today or date.today()
+    prev_by_id = {r["id"]: r for r in (prev_rows or []) if r.get("id")}
+    cutoff = (today - timedelta(days=ALIAS_DAYS)).isoformat()
+    renamed = 0
+    for row in listings:
+        prev = prev_by_id.get(row.get("id")) if row.get("id") else None
+        if not prev:
+            continue
+        aliases = {al["url"]: al["since"] for al in (prev.get("aliases") or [])}
+        if prev.get("url") and prev["url"] != row["url"]:
+            if prev["url"] not in aliases:
+                renamed += 1
+            aliases.setdefault(prev["url"], today.isoformat())
+        aliases.pop(row["url"], None)
+        aliases = {u: since for u, since in aliases.items() if since >= cutoff}
+        if aliases:
+            row["aliases"] = [{"url": u, "since": since} for u, since in aliases.items()]
+    if renamed:
+        print(f"  {renamed} renamed listing(s) detected; their old URLs will be queried alongside the new ones for {ALIAS_DAYS} days")
+    return listings
+
+
+def history_week_windows(today=None):
+    """
+    The two most recent COMPLETE Monday-Sunday weeks, oldest first, as
+    (week_start, gsc_end, ga4_end) tuples. Each end is capped at what that
+    API can actually see yet (Search Console lags about 3 days, GA4 about 1).
+
+    Two weeks, not one, because the newest complete week is still missing its
+    last couple of Search Console days when the Monday cron runs; the next
+    run's second window re-pulls that week once the data has settled, and
+    build_updated_history replaces the earlier, partial numbers.
+
+    NEVER the current, unfinished week. 1.5.4 pinned the weekly pull to the
+    current week, but the cron runs Monday, before the new week has any data
+    either API can return, so every Monday run appended a point of all zeros
+    to every chart (found 2026-10-06, the week 1.5.4 first ran live).
+    """
+    today = today or date.today()
+    last_ws = week_start(today) - timedelta(days=7)
+    out = []
+    for ws in (last_ws - timedelta(days=7), last_ws):
+        we = ws + timedelta(days=6)
+        out.append((ws, min(we, today - timedelta(days=3)), min(we, today - timedelta(days=1))))
+    return out
+
+
+def make_history_points(r):
+    """
+    Compact weekly snapshots for the trend chart, one per week in r["_weeks"]
+    (see history_week_windows). Deliberately lean: only what a trend line
+    needs, no top_queries and no traffic_sources breakdown.
+
+    IMPORTANT: reads the fixed-week pulls in r["_weeks"], NOT r["gsc"] /
+    r["ga4"], which are 28-day rolling totals. Mixing a 28-day total into the
+    same array as true 7-day weekly points would make every point look about
+    4x too high, same number in a different unit.
+
+    triage_flag is a snapshot of THIS run's judgment, so only the newest week
+    gets it; the older, re-pulled week gets None and build_updated_history
+    keeps whatever flag that point already had.
+    """
+    points = []
+    weeks = r.get("_weeks") or []
+    for i, wk in enumerate(weeks):
+        gsc = wk.get("gsc", {})
+        ga4 = wk.get("ga4", {})
+        newest = (i == len(weeks) - 1)
+        points.append({
+            "date": wk["week_start"],
+            "impressions": gsc.get("impressions", 0),
+            "clicks": gsc.get("clicks", 0),
+            "ctr": gsc.get("ctr", 0.0),
+            "position": gsc.get("position", 0.0),
+            "sessions": ga4.get("sessions", 0),
+            "avg_engagement_seconds": ga4.get("avg_engagement_seconds", 0.0),
+            "contact_clicks": ga4.get("contact_clicks"),
+            "connect_pageviews": ga4.get("connect_pageviews"),
+            "triage_flag": r.get("triage_flag", "error") if newest else None,
+        })
+    return points
 
 
 def build_updated_history(results, existing_history_index):
@@ -919,17 +1202,27 @@ def build_updated_history(results, existing_history_index):
     of appending, so re-running the sync any number of times in the same
     week is safe and just keeps that week's point fresh, never duplicates it.
     """
+    # Convert any URL-keyed history from before 1.5.9 (a no-op once converted).
+    existing_history_index = migrate_history_keys(existing_history_index, results)
     new_index = {}
+    this_monday = week_start(date.today()).isoformat()
     for r in results:
-        url = r.get("url")
-        if not url:
+        if not r.get("url"):
             continue
-        prior = list(existing_history_index.get(url, []))
+        key = row_key(r)
+        # Drop any point for the current (unfinished) week or later. Only
+        # complete weeks are valid history, and this also clears the all-zero
+        # point that 1.5.4 wrote on its first Monday run.
+        prior = [p for p in existing_history_index.get(key, []) if str(p.get("date", "")) < this_monday]
         if "gsc" in r and "ga4" in r:
-            point = make_history_point(r)
-            prior = [p for p in prior if p.get("date") != point["date"]]
-            prior.append(point)
-        new_index[url] = prior[-HISTORY_MAX_WEEKS:]
+            for point in make_history_points(r):
+                existing = next((p for p in prior if p.get("date") == point["date"]), None)
+                if existing is not None and point.get("triage_flag") is None:
+                    point["triage_flag"] = existing.get("triage_flag")   # keep the older week's own flag
+                prior = [p for p in prior if p.get("date") != point["date"]]
+                prior.append(point)
+            prior.sort(key=lambda p: str(p.get("date", "")))
+        new_index[key] = prior[-HISTORY_MAX_WEEKS:]
 
     # Keep the history of any URL that is missing from THIS run, as long as it
     # has a point from the last 12 weeks. Before 1.5.7 this index was built only
@@ -937,9 +1230,9 @@ def build_updated_history(results, existing_history_index):
     # run (a failed BD fetch) lost its whole weekly history the same moment.
     # Pruning after 12 weeks stops deleted listings from piling up forever.
     cutoff = (date.today() - timedelta(days=84)).isoformat()
-    for url, pts in existing_history_index.items():
-        if url not in new_index and pts and str(pts[-1].get("date", "")) >= cutoff:
-            new_index[url] = pts
+    for key, pts in existing_history_index.items():
+        if key not in new_index and pts and str(pts[-1].get("date", "")) >= cutoff:
+            new_index[key] = [p for p in pts if str(p.get("date", "")) < this_monday]
     return new_index
 
 
@@ -1117,30 +1410,27 @@ def main():
 
     bd_failures = {}
     listings = get_bd_listings(bd_failures)
-    listings = carry_forward_failed(listings, bd_failures)
+    prev_results, _ = fetch_existing_json(GITHUB_FILE_PATH)
+    prev_rows = (prev_results or {}).get("listings") or []
+    listings = carry_forward_failed(listings, bd_failures, prev_rows)
+    listings = attach_aliases(listings, prev_rows)
     results = []
 
-    # The weekly history pull is pinned to THIS calendar week — Monday
-    # through the earliest of (Sunday, however far each API's own lag lets
-    # us see). Computed once, outside the loop, so every listing this run
-    # gets the exact same window. A trailing "7 days ending near whenever
-    # the script runs" window (the old approach) drifts with run timing —
-    # two runs a few days apart can both capture the same underlying days,
-    # double-counting real activity across two "weekly" points instead of
-    # each point representing one real, non-overlapping week. See
-    # get_gsc_stats/get_ga4_stats docstrings for the override mechanism.
-    this_week_start = week_start(date.today())
-    this_week_end = this_week_start + timedelta(days=6)
-    gsc_week_end = min(this_week_end, date.today() - timedelta(days=3))
-    ga4_week_end = min(this_week_end, date.today() - timedelta(days=1))
+    # Weekly history pulls: the two most recent COMPLETE Monday-Sunday weeks,
+    # computed once so every listing gets identical windows. See
+    # history_week_windows for why it is two weeks and never the current one.
+    week_windows = history_week_windows()
 
     # Pass 1: collect every listing's raw GSC/GA4 data. No triage flag yet --
     # the percentile cutoffs below can only be computed once this run's full
     # distribution is known.
     for listing in listings:
         try:
-            gsc = get_gsc_stats(gsc_service, listing["url"])
-            ga4 = get_ga4_stats(ga4_client, listing["url"])
+            # A renamed listing's old URL(s) are queried too and summed in, so a
+            # rename never drops its earlier traffic out of the numbers.
+            urls = [listing["url"]] + [a["url"] for a in listing.get("aliases", [])]
+            gsc = fetch_period(lambda u, **kw: get_gsc_stats(gsc_service, u, **kw), urls)
+            ga4 = fetch_period(lambda u, **kw: get_ga4_stats(ga4_client, u, **kw), urls)
             if TRACK_CONNECT_PAGEVIEWS and listing["post_type"] == "profile":
                 ga4["connect_pageviews"] = get_connect_pageviews(ga4_client, listing["url"])
             else:
@@ -1154,20 +1444,20 @@ def main():
             else:
                 ga4["outbound_clicks_by_domain"] = None
 
-            # Fixed-calendar-week pull, for history.json ONLY — see
-            # make_history_point's docstring for why this can't reuse the
-            # 28-day gsc/ga4 above. include_queries=False since history
-            # doesn't need top_queries, saving one GSC call per listing.
-            gsc_week = get_gsc_stats(
-                gsc_service, listing["url"], include_queries=False,
-                start_override=this_week_start, end_override=gsc_week_end,
-            )
-            ga4_week = get_ga4_stats(
-                ga4_client, listing["url"],
-                start_override=this_week_start, end_override=ga4_week_end,
-            )
+            # Fixed complete-week pulls, for history.json ONLY: not the 28-day
+            # gsc/ga4 above (different unit, see make_history_points).
+            # include_queries=False since history doesn't need top_queries.
+            weeks = []
+            for ws, gsc_end, ga4_end in week_windows:
+                weeks.append({
+                    "week_start": ws.isoformat(),
+                    "gsc": fetch_period(lambda u, **kw: get_gsc_stats(gsc_service, u, include_queries=False, **kw),
+                                        urls, start_override=ws, end_override=gsc_end),
+                    "ga4": fetch_period(lambda u, **kw: get_ga4_stats(ga4_client, u, **kw),
+                                        urls, start_override=ws, end_override=ga4_end),
+                })
 
-            results.append({**listing, "gsc": gsc, "ga4": ga4, "_gsc_week": gsc_week, "_ga4_week": ga4_week})
+            results.append({**listing, "gsc": gsc, "ga4": ga4, "_weeks": weeks})
         except Exception as e:
             # One bad URL shouldn't kill the whole run
             results.append({**listing, "error": str(e)})
@@ -1194,8 +1484,7 @@ def main():
     # fields so this promise actually holds — they were never part of this
     # file's schema.
     for r in results:
-        r.pop("_gsc_week", None)
-        r.pop("_ga4_week", None)
+        r.pop("_weeks", None)
     payload = {
         "generated_at": date.today().isoformat(),
         "lookback_days": LOOKBACK_DAYS,
@@ -1210,7 +1499,8 @@ def main():
         "generated_at": date.today().isoformat(),
         "lookback_days": LOOKBACK_DAYS,
         "history_max_weeks": HISTORY_MAX_WEEKS,
-        "history": new_history_index,  # {listing_url: [weekly_point, ...]}
+        "history": new_history_index,  # {id: [weekly_point, ...]}; id is profile_<user_id> or listing_<group_id>
+        "urls": {row_key(r): r["url"] for r in results if r.get("url")},   # id -> current url, for humans reading the file
     }
     publish_to_github(history_payload, GITHUB_HISTORY_FILE_PATH)
 
