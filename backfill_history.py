@@ -52,6 +52,7 @@ from google.analytics.data_v1beta.types import RunReportRequest, DateRange, Dime
 
 from listing_stats_sync import (
     get_google_credentials, get_bd_listings, fetch_existing_json, publish_to_github,
+    row_key, migrate_history_keys,
     GSC_SITE_URL, GA4_PROPERTY_ID, GITHUB_HISTORY_FILE_PATH, HISTORY_MAX_WEEKS,
     bd_url_to_ga4_path,
 )
@@ -162,6 +163,9 @@ def main():
 
     existing_history, _ = fetch_existing_json(GITHUB_HISTORY_FILE_PATH)
     history_index = dict((existing_history or {}).get("history", {}))
+    # History is keyed by a listing's stable id since listing_stats_sync 1.5.9;
+    # this converts any older URL-keyed file first (a no-op once converted).
+    history_index = migrate_history_keys(history_index, listings)
 
     end = date.today() - timedelta(days=3)  # match the regular sync's GSC lag buffer
     start = end - timedelta(weeks=BACKFILL_WEEKS)
@@ -188,7 +192,8 @@ def main():
         # it just always re-verifies the most recent stretch against fresh
         # data every time backfill runs.
         cutoff = (week_start(end) - timedelta(days=7)).isoformat()
-        trusted_prior = [pt for pt in history_index.get(url, []) if pt["date"] < cutoff]
+        key = row_key(listing)
+        trusted_prior = [pt for pt in history_index.get(key, []) if pt["date"] < cutoff]
         existing_weeks = {pt["date"] for pt in trusted_prior}
         all_week_keys = sorted(set(gsc_weeks) | set(ga4_weeks))
         new_points = []
@@ -214,7 +219,7 @@ def main():
             trusted_prior + new_points,
             key=lambda pt: pt["date"],
         )[-HISTORY_MAX_WEEKS:]
-        history_index[url] = merged
+        history_index[key] = merged
         print(f"    +{len(new_points)} weeks backfilled ({len(merged)} total on file)")
 
     history_payload = {
@@ -222,6 +227,7 @@ def main():
         "backfilled_at": date.today().isoformat(),
         "history_max_weeks": HISTORY_MAX_WEEKS,
         "history": history_index,
+        "urls": {row_key(l): l["url"] for l in listings if l.get("url")},
     }
     publish_to_github(history_payload, GITHUB_HISTORY_FILE_PATH)
     print("Backfill complete — history.json published.")
