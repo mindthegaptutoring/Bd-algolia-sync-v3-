@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.9
+Version: 1.5.10
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -221,6 +221,19 @@ Version: 1.5.9
           looks history up by id and falls back to url. history.json also gains
           a readable id -> current url map under "urls". backfill_history.py
           uses the same keys.
+  1.5.10 — GitHub calls now retry transient failures, and reads fail loudly.
+          A backfill that had finished all 155 listings was lost when the
+          final publish got a 502 Bad Gateway from api.github.com: publish had
+          no retry. Worse, fetch_existing_json treated ANY non-200 reply as
+          "the file does not exist, start from scratch", so a 502 at the START
+          of a run would have silently begun from an empty history and
+          published it, the same wipe as 2026-09-28. Now every GitHub request
+          retries 429/5xx/connection errors/timeouts (10, 20, 40, 80 second
+          waits); a read that still fails raises and aborts the run instead of
+          starting fresh (only a real 404 means "no file yet"); a 409 on write
+          re-reads the sha and tries again. fetch_existing_json(strict=False)
+          keeps the old forgiving behavior for the reviews unchanged-check,
+          where a failed read just means "publish".
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -1241,13 +1254,53 @@ def build_updated_history(results, existing_history_index):
 # 7. GitHub read/publish — generalized in 1.4.0 to take a file_path, since
 #    two files are now published each run instead of one
 # ---------------------------------------------------------------------------
-def fetch_existing_json(file_path):
+GITHUB_RETRY_STATUSES = (429, 500, 502, 503, 504)
+
+
+def _github_call(fn, what, attempts=5):
+    """
+    Run a GitHub request (a zero-argument function returning a Response),
+    retrying transient failures: 429 and 5xx replies, connection errors and
+    timeouts. Waits 10, 20, 40, 80 seconds between attempts. A non-retryable
+    reply (200, 404, 409, 422...) is returned for the caller to judge. If every
+    attempt fails, the last HTTP error is raised, or RuntimeError if there was
+    never a reply. Added in 1.5.10 after a 502 from GitHub's API on the final
+    publish discarded a ~20 minute backfill that had otherwise finished.
+    """
+    last = None
+    for attempt in range(1, attempts + 1):
+        resp = None
+        try:
+            resp = fn()
+            if resp.status_code not in GITHUB_RETRY_STATUSES:
+                return resp
+            last = f"HTTP {resp.status_code}"
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last = type(e).__name__
+        if attempt < attempts:
+            wait = min(120, 10 * 2 ** (attempt - 1))
+            print(f"  GitHub {what} failed ({last}); retry {attempt}/{attempts - 1} in {wait}s")
+            time.sleep(wait)
+    if resp is not None:
+        resp.raise_for_status()
+    raise RuntimeError(f"GitHub {what} failed after {attempts} attempts ({last})")
+
+
+def fetch_existing_json(file_path, strict=True):
     """
     GET the currently-published JSON at file_path (content + sha), so a run
     can build on top of it instead of starting fresh. Returns
-    (parsed_json_or_None, sha_or_None). A missing file, a network hiccup, or
-    unparseable content all just fall back to None — callers treat that as
-    "start from scratch", never as a fatal error.
+    (parsed_json_or_None, sha_or_None).
+
+    A file that genuinely does not exist (404) returns (None, None), and
+    callers treat that as "start from scratch". Anything else that goes wrong
+    reading it (a 5xx that survives retries, a network failure, content that
+    cannot be parsed) RAISES when strict=True, the default, so a run aborts
+    instead of quietly starting from an empty file and publishing that over the
+    real history. That used to be the behavior here: any non-200 reply meant
+    "start fresh", so one transient GitHub error at the start of a run would
+    have wiped history exactly as the 1 MiB problem below did. strict=False
+    keeps the old forgiving behavior for callers where that is harmless.
 
     IMPORTANT: GitHub's Contents API only returns file content inline
     (base64 in the `content` field) for files under 1 MiB (1,048,576 bytes).
@@ -1267,35 +1320,44 @@ def fetch_existing_json(file_path):
     """
     api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-    resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH})
-    if resp.status_code != 200:
+
+    def fail(msg, exc=None):
+        if strict:
+            raise RuntimeError(f"{msg} Aborting instead of starting from an empty file.") from exc
+        print(f"  {msg} Starting fresh.")
         return None, None
+
+    try:
+        resp = _github_call(
+            lambda: requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=60),
+            f"read of {file_path}")
+    except Exception as e:
+        return fail(f"Could not read {file_path} from GitHub ({e}).", e)
+    if resp.status_code == 404:
+        return None, None
+    if resp.status_code != 200:
+        return fail(f"Could not read {file_path} from GitHub (HTTP {resp.status_code}).")
     data = resp.json()
     sha = data.get("sha")
 
     raw_content = data.get("content")
     if raw_content:
         try:
-            content = base64.b64decode(raw_content).decode("utf-8")
-            return json.loads(content), sha
+            return json.loads(base64.b64decode(raw_content).decode("utf-8")), sha
         except Exception as e:
-            print(f"  Could not parse existing {file_path} ({e}) — starting fresh.")
-            return None, sha
+            return fail(f"Could not parse existing {file_path} ({e}).", e)
 
-    # content was empty/absent — almost certainly the >1MiB case, not a
-    # missing file (a missing file returns 404 above, not 200 with no
-    # content). Fetch the raw bytes directly instead.
+    # content was empty/absent: almost certainly the >1MiB case, not a missing
+    # file (a missing file returns 404 above). Fetch the raw bytes instead.
     download_url = data.get("download_url")
     if not download_url:
-        print(f"  {file_path} returned no inline content and no download_url — starting fresh.")
-        return None, sha
+        return fail(f"{file_path} returned no inline content and no download_url.")
     try:
-        raw_resp = requests.get(download_url)
+        raw_resp = _github_call(lambda: requests.get(download_url, timeout=120), f"download of {file_path}")
         raw_resp.raise_for_status()
         return json.loads(raw_resp.text), sha
     except Exception as e:
-        print(f"  Could not fetch/parse {file_path} via download_url ({e}) — starting fresh.")
-        return None, sha
+        return fail(f"Could not fetch/parse {file_path} via download_url ({e}).", e)
 
 
 def fetch_and_publish_reviews():
@@ -1367,7 +1429,7 @@ def fetch_and_publish_reviews():
         # generated_at is deliberately left out of the comparison, since it
         # changes daily even when no review does. If the existing file
         # can't be read for any reason, fall through and publish.
-        existing, _ = fetch_existing_json("listing-stats/reviews.json")
+        existing, _ = fetch_existing_json("listing-stats/reviews.json", strict=False)   # a failed read just means "publish"
         if existing is not None and existing.get("reviews") == by_user:
             print(f"  reviews unchanged ({len(by_user)} educators, {len(rows)} reviews) — skipped write")
             return
@@ -1380,24 +1442,37 @@ def fetch_and_publish_reviews():
 
 
 def publish_to_github(payload, file_path):
+    """
+    Write payload to file_path in the repo through the Contents API. Every
+    request retries through transient GitHub errors (see _github_call). The
+    sha is read fresh right before each write; a 409 (the file changed in the
+    seconds between the read and the write, or an earlier attempt that returned
+    a 502 had actually landed) re-reads the sha and writes again, up to 3 times.
+    """
     api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-
-    # Need the current file's sha to update it (GitHub Contents API requirement)
-    existing = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH})
-    sha = existing.json().get("sha") if existing.status_code == 200 else None
-
     content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
-    body = {
-        "message": f"Update {file_path} — {date.today().isoformat()}",
-        "content": content_b64,
-        "branch": GITHUB_BRANCH,
-    }
-    if sha:
-        body["sha"] = sha
 
-    put_resp = requests.put(api_url, headers=headers, json=body)
-    put_resp.raise_for_status()
+    for attempt in range(1, 4):
+        existing = _github_call(
+            lambda: requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=60),
+            f"sha lookup for {file_path}")
+        sha = existing.json().get("sha") if existing.status_code == 200 else None
+        body = {
+            "message": f"Update {file_path} — {date.today().isoformat()}",
+            "content": content_b64,
+            "branch": GITHUB_BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
+        put_resp = _github_call(
+            lambda: requests.put(api_url, headers=headers, json=body, timeout=180),
+            f"write of {file_path}")
+        if put_resp.status_code == 409 and attempt < 3:
+            print(f"  {file_path} changed while writing (409); re-reading and trying again ({attempt}/2)")
+            continue
+        put_resp.raise_for_status()
+        return
 
 
 # ---------------------------------------------------------------------------
