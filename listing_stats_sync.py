@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.10
+Version: 1.5.11
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -221,6 +221,9 @@ Version: 1.5.10
           looks history up by id and falls back to url. history.json also gains
           a readable id -> current url map under "urls". backfill_history.py
           uses the same keys.
+  1.5.11 — posted_date for listings now comes from the group's date_updated
+          (its creation date) instead of the cover photo's date_added, which
+          re-dated listings whenever a thumbnail was replaced.
   1.5.10 — GitHub calls now retry transient failures, and reads fail loudly.
           A backfill that had finished all 155 listings was lost when the
           final publish got a 502 Bad Gateway from api.github.com: publish had
@@ -360,30 +363,23 @@ def bd_get(endpoint: str, params: dict = None) -> dict:
 
 def _extract_posted_date_iso(listing: dict):
     """
-    Best-effort creation-date proxy for a Classes & Resources listing.
-    users_portfolio_groups has no clean "created" column on this API surface
-    (confirmed against the admin tooling's response shape — group_date is
-    always null). The closest real proxy is the cover photo's date_added,
-    since photos are normally uploaded at listing-creation time. Tries a
-    couple of plausible field shapes defensively; returns None (not a guess)
-    if none are present, since this API endpoint's exact shape for this
-    field hasn't been confirmed yet from the sync script's own auth context
-    — verify after first deploy that this is actually populating, and adjust
-    the field path here if BD returns something different than expected.
+    Creation date for a Classes & Resources listing, as YYYY-MM-DD.
+
+    BD's `group_date` is always null, but the group record's `date_updated`
+    (YYYYMMDDHHMMSS) is set when the listing is created and is NOT touched by
+    later edits (those only move `revision_timestamp`). Verified Oct 2026
+    against the admin "Created" column on three listings, and no listing's
+    date_updated precedes its owner's signup date.
+
+    Do NOT use the cover photo's `photo_date_added`: replacing a thumbnail
+    re-dates it, which made old listings look brand new (v1.5.11 fix).
+    Returns None (not a guess) if the field is missing.
     """
-    portfolio = listing.get("users_portfolio") or {}
-    if isinstance(portfolio, list) and portfolio:
-        portfolio = portfolio[0]
-    raw = portfolio.get("photo_date_added") if isinstance(portfolio, dict) else None
-    if not raw:
-        raw = listing.get("group_date") or listing.get("date_created")
-    if not raw or len(str(raw)) < 8:
+    raw = listing.get("date_updated") or listing.get("group_date") or listing.get("date_created")
+    raw = str(raw or "")
+    if len(raw) < 8 or not raw[:8].isdigit():
         return None
-    raw = str(raw)
-    try:
-        return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
-    except Exception:
-        return None
+    return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
 
 
 def _fetch_user(uid):
