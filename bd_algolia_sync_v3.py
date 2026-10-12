@@ -103,6 +103,7 @@ SCHEDULING_MAP = {
 DELIVERY_MAP = {
     "synchronous":              "Live, scheduled sessions",
     "asynchronous":             "Self-paced, learn anytime",
+    "hybrid":                   "Hybrid, mix of both",
     "synchronous_asynchronous": "Hybrid, mix of both",
 }
 
