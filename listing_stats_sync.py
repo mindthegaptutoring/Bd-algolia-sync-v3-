@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.11
+Version: 1.5.12
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -221,6 +221,13 @@ Version: 1.5.11
           looks history up by id and falls back to url. history.json also gains
           a readable id -> current url map under "urls". backfill_history.py
           uses the same keys.
+  1.5.12 — posted_date can only move EARLIER between runs. BD re-stamps
+          date_updated (and revision_timestamp) on some writes, and a bulk
+          write on 2026-10-04 re-dated ~10 old listings to that day, which put
+          the dashboard's red dot in the middle of real traffic history.
+          apply_posted_date_ratchet() keeps the earlier of last published
+          posted_date and BD's current value. Seed results.json with
+          recovered dates once; after that old dates stick.
   1.5.11 — posted_date for listings now comes from the group's date_updated
           (its creation date) instead of the cover photo's date_added, which
           re-dated listings whenever a thumbnail was replaced.
@@ -567,6 +574,25 @@ def get_bd_listings(failures=None) -> list:
         time.sleep(3.0)  # same per-user pacing as bd_algolia_sync_v3.py -- keeps this under BD's ~100 req/min limit
 
     return results
+
+
+def apply_posted_date_ratchet(listings, prev_rows):
+    """Keep the earlier of the previously published posted_date and the one
+    BD reports now, matched by listing id (or url). A later BD value is a
+    re-stamp, not a new creation. Returns how many rows were held back."""
+    prev = {}
+    for r in prev_rows or []:
+        for key in (r.get("id"), r.get("url")):
+            if key and r.get("posted_date"):
+                prev[key] = r["posted_date"]
+    held = 0
+    for row in listings:
+        old = prev.get(row.get("id")) or prev.get(row.get("url"))
+        new = row.get("posted_date")
+        if old and (not new or old < new):
+            row["posted_date"] = old
+            held += 1
+    return held
 
 
 def carry_forward_failed(listings, failures, prev_rows=None):
@@ -1485,6 +1511,9 @@ def main():
     prev_rows = (prev_results or {}).get("listings") or []
     listings = carry_forward_failed(listings, bd_failures, prev_rows)
     listings = attach_aliases(listings, prev_rows)
+    held = apply_posted_date_ratchet(listings, prev_rows)
+    if held:
+        print(f"posted_date: kept the earlier published date for {held} listing(s)")
     results = []
 
     # Weekly history pulls: the two most recent COMPLETE Monday-Sunday weeks,
