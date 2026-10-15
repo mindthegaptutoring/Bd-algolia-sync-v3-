@@ -1,0 +1,38 @@
+name: Index check (URL Inspection)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth
+
+      - name: Write Google credentials to a temp file
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_CREDENTIALS_JSON" > "$RUNNER_TEMP/google-credentials.json"
+
+      - name: Run URL Inspection on the listing URLs
+        env:
+          GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/google-credentials.json
+          GSC_SITE_URL: ${{ secrets.GSC_SITE_URL }}
+        run: |
+          python index-check/gsc_inspect_urls.py \
+            index-check/zero_impression_listings_to_check.csv \
+            index_check_results.csv
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-check-results
+          path: index_check_results.csv
