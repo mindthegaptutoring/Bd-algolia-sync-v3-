@@ -1,0 +1,65 @@
+name: Fill History Gaps
+
+# Manual trigger only. Go to the Actions tab, pick "Fill History Gaps", and press Run workflow.
+# It adds weekly chart points that are missing from history.json, using real Google
+# Analytics and Search Console numbers. It never changes a point that already exists.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true = pull the numbers and show the report, but publish nothing'
+        required: false
+        default: 'false'
+      only_ids:
+        description: 'Optional: limit to some listings, comma separated, e.g. listing_138,listing_173'
+        required: false
+        default: ''
+
+jobs:
+  fill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google service account credentials
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: echo "$GOOGLE_CREDENTIALS_JSON" > google-credentials.json
+
+      - name: Fill the gaps
+        env:
+          BD_API_KEY: ${{ secrets.BD_API_KEY }}
+          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
+          GSC_SITE_URL: https://www.learnwitheveryavenue.com/
+          GOOGLE_CREDENTIALS_PATH: google-credentials.json
+          # Same token the backfill workflow uses: write access to mindthegaptutoring/lwea-search
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_LWEA_SEARCH }}
+          GITHUB_REPO: mindthegaptutoring/lwea-search
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          ONLY_IDS: ${{ github.event.inputs.only_ids }}
+        run: python fill_history_gaps.py
+
+      # Print the report straight into the log so there is nothing to download.
+      - name: Show report
+        if: always()
+        run: |
+          if [ -f history_gap_fill_report.csv ]; then cat history_gap_fill_report.csv; else echo "No report was written."; fi
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-gap-fill-report
+          path: history_gap_fill_report.csv
+          if-no-files-found: ignore
+          retention-days: 14
