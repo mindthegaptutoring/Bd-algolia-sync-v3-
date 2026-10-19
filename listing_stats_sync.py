@@ -337,7 +337,7 @@ LOW_ENGAGEMENT_PERCENTILE = 25    # bottom this % of avg engagement (among listi
 SESSION = requests.Session()
 
 def bd_request(method: str, endpoint: str, *, params=None, body=None,
-                max_retries: int = 5, base_delay: float = 0.5) -> dict:
+                max_retries: int = 6, base_delay: float = 2.0) -> dict:
     url = f"{BD_BASE_URL}{endpoint}"
     params = params or {}
     for attempt in range(max_retries):
@@ -544,6 +544,7 @@ def get_bd_listings(failures=None) -> list:
             })
 
         print(f"  [{i}/{len(users)}] {name} (user_id={uid}) - fetching listings")
+        time.sleep(0.5)
         user_listings = None
         for attempt in range(3):
             try:
