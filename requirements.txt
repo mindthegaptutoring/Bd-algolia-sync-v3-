@@ -3,3 +3,4 @@ requests
 google-auth>=2.29.0
 google-api-python-client>=2.126.0
 google-analytics-data>=0.18.0
+certifi>=2026.10.19
