@@ -1,0 +1,65 @@
+name: Listing Stats Sync (manual, with dry run)
+
+# Manual trigger only. The scheduled weekly sync still runs on Render
+# (python listing_stats_sync.py); this workflow does not replace it.
+#
+# Go to the Actions tab, pick this workflow, press Run workflow.
+#   dry_run = true  (the default here): fetches everything from BD, Search Console and GA4
+#                   exactly like a normal run, but publishes NOTHING to lwea-search. The
+#                   would-be results.json and history.json are attached to the run as the
+#                   "listing-stats-dry-run" artifact, and the check (outbound_clicks
+#                   cross-check, existing history fields vs the live file) is printed in the
+#                   "Run listing stats sync" step's log.
+#   dry_run = false: a real run. It commits results.json and history.json to
+#                   mindthegaptutoring/lwea-search main, the same as the Render cron.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true = publish nothing, save the files and print the check. false = real run, commits to lwea-search main'
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google service account credentials
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: echo "$GOOGLE_CREDENTIALS_JSON" > google-credentials.json
+
+      - name: Run listing stats sync
+        env:
+          BD_API_KEY: ${{ secrets.BD_API_KEY }}
+          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
+          GSC_SITE_URL: https://www.learnwitheveryavenue.com/
+          GOOGLE_CREDENTIALS_PATH: google-credentials.json
+          # Same token the backfill and gap-fill workflows use. A dry run only READS with it.
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_LWEA_SEARCH }}
+          GITHUB_REPO: mindthegaptutoring/lwea-search
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: python listing_stats_sync.py
+
+      # Keep the would-be files even when the check fails, so they can be inspected.
+      - name: Keep the dry-run files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: listing-stats-dry-run
+          path: dry_run_output/
+          if-no-files-found: ignore
+          retention-days: 14
