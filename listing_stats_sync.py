@@ -1,7 +1,7 @@
 """
 LWEA Listing Stats Sync
 ========================
-Version: 1.5.12
+Version: 1.5.13
   1.0.0 — initial working version: BD user-probing, GSC + GA4 per-listing pull,
           triage flags, GitHub-published results.json
   1.1.0 — corrected CONTACT_EVENT_NAME to the real, confirmed-live "mailto_click"
@@ -244,6 +244,27 @@ Version: 1.5.12
           re-reads the sha and tries again. fetch_existing_json(strict=False)
           keeps the old forgiving behavior for the reviews unchanged-check,
           where a failed read just means "publish".
+  1.5.13 — weekly history points gain `outbound_clicks`, placed next to
+          contact_clicks: the integer count of GA4 `click` events (Enhanced
+          Measurement outbound clicks, eventName == "click", metric eventCount)
+          on that listing's page in that Monday-Sunday week, all destinations
+          combined, a renamed listing's old URLs summed in exactly as
+          contact_clicks does (fetch_period). 0 means GA4 returned no rows.
+          It does NOT use the Link Domain custom dimension, so it works even
+          when that dimension is not registered. `outbound_clicks` STARTS AT
+          THIS RELEASE AND HAS NO BACKFILL: only the two weeks each run
+          re-pulls get it, and every older point simply has no such key (a gap,
+          not a zero). If the click query fails for a week, the key is left
+          out of that point (any value already stored for that week is kept),
+          never written as 0. No existing field, its meaning, or the shape of
+          results.json changed; get_outbound_click_stats (the 28-day
+          by-domain breakdown) is untouched, and so still queries the current
+          URL only, not old URLs. Also new: a DRY_RUN=true environment switch.
+          The run fetches everything as usual but publishes nothing; it writes
+          the would-be results.json / history.json to dry_run_output/ and
+          prints a check (outbound_clicks cross-check for 3 never-renamed
+          listings; every existing history field compared with the live file).
+          With DRY_RUN unset the behavior is exactly as before.
 Pulls per-listing search + engagement data from Google Search Console and
 GA4, keyed by BD member_id, and publishes it as JSON files that both the
 educator-facing dashboard widget and Kristen's admin triage widget can fetch
@@ -268,6 +289,7 @@ retune them.
 """
 
 import os
+import copy
 import json
 import time
 import random
@@ -308,6 +330,24 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "mindthegaptutoring/lwea-search")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "listing-stats/results.json")
 GITHUB_HISTORY_FILE_PATH = os.environ.get("GITHUB_HISTORY_FILE_PATH", "listing-stats/history.json")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+
+
+def _parse_dry_run(raw):
+    """DRY_RUN unset/empty/false -> False (the normal, publishing behavior).
+    "true" -> True. Anything else is a typo and stops the run, rather than
+    guessing and possibly publishing when a dry run was meant."""
+    val = (raw or "").strip().lower()
+    if val in ("", "false", "0", "no"):
+        return False
+    if val in ("true", "1", "yes"):
+        return True
+    raise SystemExit(f"DRY_RUN must be 'true' or 'false' (got {raw!r}); stopping without doing anything.")
+
+
+# True = fetch everything but publish NOTHING to GitHub: publish_to_github writes
+# the file under DRY_RUN_DIR instead, and main() prints the verification check.
+DRY_RUN = _parse_dry_run(os.environ.get("DRY_RUN"))
+DRY_RUN_DIR = os.environ.get("DRY_RUN_DIR", "dry_run_output")
 
 LOOKBACK_DAYS = 28
 HISTORY_MAX_WEEKS = 52  # rolling ~1 year of weekly snapshots per listing before oldest points age out
@@ -796,6 +836,39 @@ def get_outbound_click_stats(ga4_client, url):
     return {row.dimension_values[0].value: int(row.metric_values[0].value) for row in resp.rows}
 
 
+def get_outbound_click_total(ga4_client, url, start, end):
+    """
+    Total GA4 outbound link clicks on one page between start and end (dates,
+    inclusive), all destinations combined, for the weekly history points
+    (history.json `outbound_clicks`, added in 1.5.13).
+
+    Same definition as get_outbound_click_stats, minus the by-domain split:
+    pagePath equal to the page, eventName == "click" (Enhanced Measurement's
+    outbound-click event), metric eventCount. No Link Domain dimension, so it
+    does not depend on that custom dimension being registered. GA4 returns no
+    rows when there were no such events; that is a real 0.
+
+    Takes explicit dates and returns an int; the caller (main) wraps it in
+    fetch_period so a renamed listing's old URLs are summed in, like
+    contact_clicks.
+    """
+    req = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        metrics=[Metric(name="eventCount")],
+        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+        dimension_filter=FilterExpression(
+            and_group=FilterExpressionList(expressions=[
+                FilterExpression(filter=Filter(field_name="pagePath",
+                                               string_filter=Filter.StringFilter(value=bd_url_to_ga4_path(url)))),
+                FilterExpression(filter=Filter(field_name="eventName",
+                                               string_filter=Filter.StringFilter(value="click"))),
+            ])
+        ),
+    )
+    resp = ga4_client.run_report(req)
+    return sum(int(row.metric_values[0].value) for row in resp.rows)
+
+
 def get_ga4_stats(ga4_client, url, days=LOOKBACK_DAYS, start_override=None, end_override=None):
     """See get_gsc_stats's docstring for why start_override/end_override
     exist — same fixed-calendar-week reasoning applies here."""
@@ -1201,7 +1274,7 @@ def make_history_points(r):
         gsc = wk.get("gsc", {})
         ga4 = wk.get("ga4", {})
         newest = (i == len(weeks) - 1)
-        points.append({
+        point = {
             "date": wk["week_start"],
             "impressions": gsc.get("impressions", 0),
             "clicks": gsc.get("clicks", 0),
@@ -1210,9 +1283,14 @@ def make_history_points(r):
             "sessions": ga4.get("sessions", 0),
             "avg_engagement_seconds": ga4.get("avg_engagement_seconds", 0.0),
             "contact_clicks": ga4.get("contact_clicks"),
-            "connect_pageviews": ga4.get("connect_pageviews"),
-            "triage_flag": r.get("triage_flag", "error") if newest else None,
-        })
+        }
+        # outbound_clicks (1.5.13): only when this run actually fetched it. Left out,
+        # not 0, otherwise, so the report shows a gap. Never backfilled.
+        if isinstance(ga4.get("outbound_clicks"), int) and not isinstance(ga4.get("outbound_clicks"), bool):
+            point["outbound_clicks"] = ga4["outbound_clicks"]
+        point["connect_pageviews"] = ga4.get("connect_pageviews")
+        point["triage_flag"] = r.get("triage_flag", "error") if newest else None
+        points.append(point)
     return points
 
 
@@ -1255,7 +1333,10 @@ def build_updated_history(results, existing_history_index):
                 existing = next((p for p in prior if p.get("date") == point["date"]), None)
                 if existing is not None and point.get("triage_flag") is None:
                     point["triage_flag"] = existing.get("triage_flag")   # keep the older week's own flag
-                prior = [p for p in prior if p.get("date") != point["date"]]
+                if existing is not None and "outbound_clicks" not in point and "outbound_clicks" in existing:
+                    # This run's click query failed for the week: keep the value an earlier run stored.
+                    point["outbound_clicks"] = existing["outbound_clicks"]
+                prior =[p for p in prior if p.get("date") != point["date"]]
                 prior.append(point)
             prior.sort(key=lambda p: str(p.get("date", "")))
         new_index[key] = prior[-HISTORY_MAX_WEEKS:]
@@ -1472,6 +1553,16 @@ def publish_to_github(payload, file_path):
     seconds between the read and the write, or an earlier attempt that returned
     a 502 had actually landed) re-reads the sha and writes again, up to 3 times.
     """
+    if DRY_RUN:
+        # The one place every write to GitHub goes through: in a dry run nothing
+        # is sent, the would-be file is saved locally instead (same formatting).
+        os.makedirs(DRY_RUN_DIR, exist_ok=True)
+        out_path = os.path.join(DRY_RUN_DIR, os.path.basename(file_path))
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2))
+        print(f"  DRY RUN: NOT published. Would have written {file_path} to {GITHUB_REPO}@{GITHUB_BRANCH}; saved {out_path} instead")
+        return
+
     api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
@@ -1496,6 +1587,190 @@ def publish_to_github(payload, file_path):
             continue
         put_resp.raise_for_status()
         return
+
+
+# ---------------------------------------------------------------------------
+# Dry-run check (1.5.13) — only runs when DRY_RUN=true
+# ---------------------------------------------------------------------------
+OUTBOUND_CHECK_LISTINGS = 3
+
+
+def _ga4_click_recheck(ga4_client, url, start, end):
+    """Independent re-count of one page's click events over start..end: the
+    contact_clicks query shape (eventName dimension, filter on pagePath only),
+    then take the "click" row. Current URL only. Different request shape from
+    get_outbound_click_total, same definition."""
+    req = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        dimensions=[Dimension(name="eventName")],
+        metrics=[Metric(name="eventCount")],
+        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+        dimension_filter=FilterExpression(
+            filter=Filter(field_name="pagePath", string_filter=Filter.StringFilter(value=bd_url_to_ga4_path(url)))),
+    )
+    resp = ga4_client.run_report(req)
+    return sum(int(r.metric_values[0].value) for r in resp.rows if r.dimension_values[0].value == "click")
+
+
+def _ga4_click_by_domain_sum(ga4_client, url, start, end):
+    """Sum of the by-domain click counts (the 28-day snapshot's query shape,
+    get_outbound_click_stats, run over the weekly dates). None if the Link
+    Domain custom dimension is not registered."""
+    req = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        dimensions=[Dimension(name="customEvent:link_domain")],
+        metrics=[Metric(name="eventCount")],
+        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+        dimension_filter=FilterExpression(
+            and_group=FilterExpressionList(expressions=[
+                FilterExpression(filter=Filter(field_name="pagePath", string_filter=Filter.StringFilter(value=bd_url_to_ga4_path(url)))),
+                FilterExpression(filter=Filter(field_name="eventName", string_filter=Filter.StringFilter(value="click"))),
+            ])
+        ),
+    )
+    try:
+        return sum(int(r.metric_values[0].value) for r in ga4_client.run_report(req).rows)
+    except Exception:
+        return None
+
+
+def dry_run_report(results, live_history, new_history, week_windows, ga4_client, live_results=None, today=None):
+    """
+    Prints the dry-run check and returns True if every hard check passed.
+
+    1. outbound_clicks cross-check: 3 listings with no alias (never renamed, as
+       far as this run can tell) and outbound clicks in the 28-day snapshot. For
+       each re-pulled week: the history point's value vs the same click count
+       re-queried over exactly the same dates, current URL only.
+    2. Every EXISTING history point vs the live history.json. Points for weeks
+       this run did not re-pull must be IDENTICAL (the new field is not added
+       to them either). Points for the re-pulled weeks are rewritten by every
+       normal run, so value drift there is listed, not failed; what must hold is
+       that no existing field disappears.
+    3. results.json key shape vs the live file (informational).
+    """
+    today = today or date.today()
+    ok = True
+    refetched = {ws.isoformat() for ws, _, _ in week_windows}
+    this_monday = week_start(today).isoformat()
+    line = "=" * 78
+    print(f"\n{line}\nDRY RUN CHECK  (nothing was published; files are in {DRY_RUN_DIR}/)\n{line}")
+    print(f"Weeks re-pulled this run: {', '.join(sorted(refetched))}")
+
+    # ---- 1. outbound_clicks cross-check --------------------------------
+    rows = []
+    for r in results:
+        if "ga4" not in r or r.get("error") or r.get("carried_forward") or r.get("aliases"):
+            continue
+        by_dom = r["ga4"].get("outbound_clicks_by_domain")
+        total = sum(v for v in by_dom.values() if _num(v)) if isinstance(by_dom, dict) else 0
+        if total > 0:
+            rows.append((total, r))
+    rows.sort(key=lambda t: (-t[0], str(row_key(t[1]))))
+    picked = rows[:OUTBOUND_CHECK_LISTINGS]
+    print(f"\n[1] outbound_clicks cross-check: {len(picked)} of {len(rows)} eligible listing(s) "
+          f"(no alias, 28-day outbound clicks > 0; picked by highest 28-day total)")
+    if len(picked) < OUTBOUND_CHECK_LISTINGS:
+        print(f"    WARNING: only {len(picked)} eligible listing(s) found, wanted {OUTBOUND_CHECK_LISTINGS}")
+        ok = False
+    n_match = n_cmp = 0
+    for total, r in picked:
+        key = row_key(r)
+        pts = {p["date"]: p for p in new_history.get(key, [])}
+        print(f"    {key}  {r['url']}\n      28-day snapshot: {total} click(s) {r['ga4'].get('outbound_clicks_by_domain')}")
+        for ws, _gsc_end, ga4_end in week_windows:
+            pt = pts.get(ws.isoformat())
+            weekly = pt.get("outbound_clicks") if pt else None
+            try:
+                recheck = _ga4_click_recheck(ga4_client, r["url"], ws, ga4_end)
+                by_dom = _ga4_click_by_domain_sum(ga4_client, r["url"], ws, ga4_end)
+            except Exception as e:
+                recheck, by_dom = None, None
+                print(f"      {ws}..{ga4_end}: recheck query failed ({e})")
+            match = (weekly is not None and weekly == recheck and (by_dom is None or by_dom == weekly))
+            n_cmp += 1
+            n_match += 1 if match else 0
+            dom_txt = "n/a (Link Domain dimension not available)" if by_dom is None else str(by_dom)
+            print(f"      {ws}..{ga4_end}: history outbound_clicks={weekly}  recheck={recheck}  "
+                  f"by-domain sum={dom_txt}  -> {'MATCH' if match else 'MISMATCH'}")
+    print(f"    result: {n_match}/{n_cmp} week comparisons match")
+    if n_cmp == 0 or n_match != n_cmp:
+        ok = False
+
+    n_series = n_with = n_without = n_nonzero = 0
+    this_run = {row_key(r) for r in results if r.get("url")}
+    for key, pts in new_history.items():
+        if key not in this_run:   # a series kept from an earlier run, not re-pulled now
+            continue
+        for p in pts:
+            if p.get("date") in refetched:
+                n_series += 1
+                if "outbound_clicks" in p:
+                    n_with += 1
+                    n_nonzero += 1 if p["outbound_clicks"] else 0
+                else:
+                    n_without += 1
+    print(f"    re-pulled points: {n_series}; with outbound_clicks: {n_with} ({n_nonzero} non-zero); "
+          f"without (query failed, left out): {n_without}")
+
+    # ---- 2. existing fields vs live history.json -----------------------
+    untouched = same = 0
+    bad, removed_unfinished, removed_other = [], 0, 0
+    drift, dropped_field = {}, 0
+    n_refetched = 0
+    for key, pts in (live_history or {}).items():
+        new_by_date = {p.get("date"): p for p in new_history.get(key, [])}
+        for p in pts:
+            d = p.get("date")
+            q = new_by_date.get(d)
+            if q is None:
+                if str(d) >= this_monday:
+                    removed_unfinished += 1
+                else:
+                    removed_other += 1
+                continue
+            if d in refetched:
+                n_refetched += 1
+                for f, v in p.items():
+                    if f not in q:
+                        dropped_field += 1
+                    elif q[f] != v:
+                        drift[f] = drift.get(f, 0) + 1
+            else:
+                untouched += 1
+                if q == p:
+                    same += 1
+                else:
+                    bad.append((key, d))
+    stray = sum(1 for pts in new_history.values() for p in pts if "outbound_clicks" in p and p.get("date") not in refetched)
+    print(f"\n[2] existing history points vs live history.json")
+    print(f"    weeks NOT re-pulled: {untouched} point(s) compared, {same} identical, {len(bad)} different "
+          f"-> {'PASS' if not bad else 'FAIL'}")
+    for key, d in bad[:10]:
+        print(f"      differs: {key} {d}")
+    print(f"    outbound_clicks present on a point outside the re-pulled weeks: {stray} -> {'PASS' if stray == 0 else 'FAIL'}")
+    print(f"    re-pulled weeks ({n_refetched} existing point(s); these are rewritten by every normal run): "
+          f"existing fields dropped: {dropped_field} -> {'PASS' if dropped_field == 0 else 'FAIL'}; "
+          f"value changes by field: {drift if drift else 'none'}")
+    print(f"    removed points: {removed_unfinished} for an unfinished week (date >= {this_monday}), "
+          f"{removed_other} other (52-week cap or a listing no longer present)")
+    if bad or stray or dropped_field:
+        ok = False
+
+    # ---- 3. results.json shape (informational) -------------------------
+    if live_results:
+        def keysets(doc):
+            lst = (doc or {}).get("listings") or []
+            return (set(doc or {}), {k for r in lst for k in r},
+                    {k for r in lst for k in (r.get("ga4") or {})}, {k for r in lst for k in (r.get("gsc") or {})})
+        names = ("top-level", "listing", "ga4", "gsc")
+        new_doc = {"generated_at": 0, "lookback_days": 0, "triage_thresholds": 0, "listings": results}
+        live_k, new_k = keysets(live_results), keysets(new_doc)
+        print("\n[3] results.json keys vs live file (informational)")
+        for nm, a, b in zip(names, live_k, new_k):
+            print(f"    {nm}: added {sorted(b - a) or 'none'}, missing {sorted(a - b) or 'none'}")
+    print(f"\nDRY RUN CHECK RESULT: {'PASS' if ok else 'FAIL'}\n{line}\n")
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -1550,12 +1825,23 @@ def main():
             # include_queries=False since history doesn't need top_queries.
             weeks = []
             for ws, gsc_end, ga4_end in week_windows:
+                week_ga4 = fetch_period(lambda u, **kw: get_ga4_stats(ga4_client, u, **kw),
+                                        urls, start_override=ws, end_override=ga4_end)
+                # Weekly outbound clicks (1.5.13): same URLs (old ones summed in) and same
+                # dates as the other weekly GA4 numbers. Lives only in this history-only
+                # dict, never in the 28-day ga4 dict, so results.json is unchanged. A failed
+                # query leaves the key out (a gap), never a made-up 0.
+                try:
+                    week_ga4["outbound_clicks"] = fetch_period(
+                        lambda u, **kw: {"outbound_clicks": get_outbound_click_total(ga4_client, u, kw["start_override"], kw["end_override"])},
+                        urls, start_override=ws, end_override=ga4_end)["outbound_clicks"]
+                except Exception as e:
+                    print(f"  weekly outbound clicks unavailable for {listing.get('url')} week {ws} ({e}) — left out of this point")
                 weeks.append({
                     "week_start": ws.isoformat(),
                     "gsc": fetch_period(lambda u, **kw: get_gsc_stats(gsc_service, u, include_queries=False, **kw),
                                         urls, start_override=ws, end_override=gsc_end),
-                    "ga4": fetch_period(lambda u, **kw: get_ga4_stats(ga4_client, u, **kw),
-                                        urls, start_override=ws, end_override=ga4_end),
+                    "ga4": week_ga4,
                 })
 
             results.append({**listing, "gsc": gsc, "ga4": ga4, "_weeks": weeks})
@@ -1577,6 +1863,8 @@ def main():
     # below for the public results.json payload.
     existing_history, _ = fetch_existing_json(GITHUB_HISTORY_FILE_PATH)
     existing_history_index = (existing_history or {}).get("history", {})
+    # Dry run: keep an untouched copy of the live history to compare against afterwards.
+    live_history_copy = copy.deepcopy(existing_history_index) if DRY_RUN else None
     new_history_index = build_updated_history(results, existing_history_index)
 
     # results.json — UNCHANGED shape from 1.3.0. Existing widgets (Widget 53's
@@ -1606,6 +1894,17 @@ def main():
     publish_to_github(history_payload, GITHUB_HISTORY_FILE_PATH)
 
     print(f"Synced {len(results)} listings. History now covers up to {HISTORY_MAX_WEEKS} weeks per listing.")
+
+    if DRY_RUN:
+        # After both files are saved, so the artifacts exist even if the check fails.
+        try:
+            passed = dry_run_report(results, live_history_copy, new_history_index, week_windows, ga4_client,
+                                    live_results=prev_results)
+        except Exception as e:
+            print(f"DRY RUN CHECK could not complete: {type(e).__name__}: {e}")
+            passed = False
+        if not passed:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
